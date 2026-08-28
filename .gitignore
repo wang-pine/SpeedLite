@@ -1,0 +1,31 @@
+# ============ 构建产物 ============
+# 版本化多平台构建输出（makeVersion.sh 生成）
+/dest/
+# Go 构建缓存回退目录（makeVersion.sh 自动使用时生成）
+/.cache/
+# 本地临时二进制
+/bin/
+*.exe
+*.tgz
+*.zip
+
+# ============ Go ============
+# src 下 go build 直接生成的二进制
+/src/speedtest-server
+/src/speedctl
+
+# ============ Node / 前端测试 ============
+node_modules/
+.tmp*/
+
+# ============ 编辑器 / 系统 ============
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# ============ 日志 ============
+*.log
+speedtest.log
