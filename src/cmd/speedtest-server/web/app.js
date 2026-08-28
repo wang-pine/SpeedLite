@@ -1,0 +1,839 @@
+/* speedTest 前端逻辑
+ *
+ * 架构：前端本地采样统计（下行数收到字节、上行数发送字节，每 100ms 采样）。
+ * 服务器只负责搬运数据：
+ *  - TCP 测速：WebSocket 打流（下行服务器发 / 上行客户端发）
+ *  - UDP 测速：WebRTC DataChannel（ordered:false, maxRetransmits:0，真实走 UDP）
+ *              信令经 /ws/signal 交换 SDP
+ *
+ * 说明：
+ *  - UDP(WebRTC unreliable) 的真实丢包率由「双端对账」实测：服务端发出/收到
+ *    与浏览器收到/发出之差即为丢包（结果表丢包率列直接展示，偏差分级警示）。
+ *    抖动无法从浏览器精确获得（0 ms，精确值请用 CLI speedctl）。
+ *  - TCP 为可靠通道，丢包率恒 0%；对账偏差若大说明网络异常/缓冲截断。
+ *  - 双向(both)方向：下行与上行同时进行，本地分别计数。
+ */
+(function () {
+'use strict';
+
+const $ = (id) => document.getElementById(id);
+
+/* ---------- 全局状态 ---------- */
+const state = {
+  running: false,
+  t0: 0,
+  durations: 0,
+  phaseText: '',
+  series: [],          // [{id, mode, dir, color, points:[{t, down, up}]}] 缓存所有测试曲线
+  curSeries: null,      // 当前正在采样的系列
+  streams: new Set(),  // 活跃流句柄（ws / pc）
+};
+
+/* ---------- 配置 ---------- */
+function getConfig() {
+  let server = $('cfgServer').value.trim();
+  if (!server) server = location.host;
+  server = server.replace(/^https?:\/\//, '').replace(/\/.*$/, '');
+  return {
+    mode: $('cfgMode').value,          // tcp | udp | both
+    dir: $('cfgDir').value,            // down | up | both
+    streams: clampInt($('cfgStreams').value, 1, 16, 4),
+    duration: clampFloat($('cfgDuration').value, 1, 120, 10),
+    packetLen: clampInt($('cfgPacketLen').value, 1024, 1048576, 131072),
+    server,
+    wsBase: (location.protocol === 'https:' ? 'wss://' : 'ws://') + server,
+  };
+}
+function clampInt(v, lo, hi, def) {
+  const n = parseInt(v, 10);
+  if (isNaN(n)) return def;
+  return Math.max(lo, Math.min(hi, n));
+}
+function clampFloat(v, lo, hi, def) {
+  const n = parseFloat(v);
+  if (isNaN(n)) return def;
+  return Math.max(lo, Math.min(hi, n));
+}
+
+/* ---------- 本地采样器：每个流一个 ---------- */
+function makeMeter() {
+  return {
+    rx: 0, tx: 0,             // 本地已计字节
+    lastRX: 0, lastTX: 0,
+    createdAt: performance.now(),
+    lastT: performance.now(),
+    peakDown: 0, peakUp: 0,   // 峰值 Mbit/s（1s 窗口平均）
+    win: [],                  // 滑动窗口（近 10 个采样）
+    // 上行校正：传入"真实已发字节"（=累计send − bufferedAmount滞留），单调递增
+    syncTX(realSent) {
+      if (realSent > this.tx) this.tx = realSent;
+    },
+    addRX(n) { this.rx += n; },
+    addTX(n) { this.tx += n; },
+    sample() {
+      const now = performance.now();
+      const dt = (now - this.lastT) / 1000;
+      if (dt <= 0) return null;
+      const downMbps = ((this.rx - this.lastRX) / dt) * 8 / 1e6;
+      const upMbps = ((this.tx - this.lastTX) / dt) * 8 / 1e6;
+      this.lastRX = this.rx;
+      this.lastTX = this.tx;
+      this.lastT = now;
+      // 峰值 = 近 1s 滑动窗口均值（消除突发尖峰），TCP/UDP 通用
+      this.win.push({ d: downMbps, u: upMbps });
+      if (this.win.length > 10) this.win.shift();
+      const n = this.win.length;
+      const dAvg = this.win.reduce((s, w) => s + w.d, 0) / n;
+      const uAvg = this.win.reduce((s, w) => s + w.u, 0) / n;
+      if (dAvg > this.peakDown) this.peakDown = dAvg;
+      if (uAvg > this.peakUp) this.peakUp = uAvg;
+      return { downMbps, upMbps };
+    },
+    elapsed() { return (performance.now() - this.createdAt) / 1000; },
+  };
+}
+
+function drainedBytes(submitted, queued) {
+  return Math.max(0, Number(submitted || 0) - Math.max(0, Number(queued || 0)));
+}
+
+/* ---------- 全局实时聚合（供大数字/曲线） ---------- */
+const live = {
+  meters: new Map(),
+  // 关键修复：add 接收真实的 meter，而不是内部再造一个空 meter
+  add(id, meter) { this.meters.set(id, meter); },
+  remove(id) { this.meters.delete(id); },
+  reset() { this.meters.clear(); },
+};
+
+/* ---------- UI ---------- */
+function setRunning(run) {
+  state.running = run;
+  $('btnStart').disabled = run;
+  $('btnStop').disabled = !run;
+  $('cfgMode').disabled = run;
+  $('cfgDir').disabled = run;
+  $('cfgStreams').disabled = run;
+  $('cfgDuration').disabled = run;
+  $('cfgPacketLen').disabled = run;
+}
+
+/* 曲线绘制（支持多条测试系列缓存叠加） */
+function drawChart() {
+  const canvas = $('chart');
+  const ctx = canvas.getContext('2d');
+  const W = canvas.width, H = canvas.height;
+  ctx.clearRect(0, 0, W, H);
+  const series = state.series;
+  if (!series.length) {
+    ctx.fillStyle = '#475569';
+    ctx.font = Math.max(13, W * 0.014) + 'px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('点击「开始测速」…', W / 2, H / 2);
+    renderLegend([]);
+    return;
+  }
+  // 窄屏（手机）压缩左边距，给曲线更多空间
+  const pad = { l: W < 480 ? 40 : 52, r: 12, t: 12, b: 28 };
+  const iw = W - pad.l - pad.r, ih = H - pad.t - pad.b;
+
+  // 时间轴取所有系列最大时长
+  let tMax = 0;
+  for (const s of series) for (const d of s.points) if (d.t > tMax) tMax = d.t;
+  if (tMax < 1) tMax = 1;
+
+  // Y 轴取所有系列最大速率
+  let maxRate = 10;
+  for (const s of series) for (const d of s.points) {
+    if (d.down > maxRate) maxRate = d.down;
+    if (d.up > maxRate) maxRate = d.up;
+  }
+  maxRate = niceCeil(maxRate);
+
+  // 网格 + 坐标
+  ctx.strokeStyle = 'rgba(148,163,184,.15)';
+  ctx.fillStyle = '#94a3b8';
+  ctx.font = '11px sans-serif';
+  ctx.textAlign = 'right';
+  ctx.lineWidth = 1;
+  const gridY = 5;
+  for (let i = 0; i <= gridY; i++) {
+    const y = pad.t + ih - (ih * i / gridY);
+    ctx.beginPath(); ctx.moveTo(pad.l, y); ctx.lineTo(W - pad.r, y); ctx.stroke();
+    ctx.fillText(fmtRate(maxRate * i / gridY), pad.l - 6, y + 4);
+  }
+  ctx.textAlign = 'center';
+  for (let i = 0; i <= 4; i++) {
+    const x = pad.l + iw * i / 4;
+    ctx.beginPath(); ctx.moveTo(x, pad.t); ctx.lineTo(x, H - pad.b); ctx.stroke();
+    ctx.fillText((tMax * i / 4).toFixed(0) + 's', x, H - 8);
+  }
+
+  const xy = (t, rate) => [
+    pad.l + (t / tMax) * iw,
+    pad.t + ih - (rate / maxRate) * ih,
+  ];
+
+  // 每个系列：下行实线、上行虚线（同色系标注线型）
+  for (const s of series) {
+    const drawSerie = (key, style) => {
+      ctx.strokeStyle = s.color;
+      ctx.lineWidth = 2;
+      ctx.setLineDash(style === 'dash' ? [6, 4] : []);
+      ctx.beginPath();
+      let first = true;
+      for (const d of s.points) {
+        if (d[key] === undefined) continue;
+        const [x, y] = xy(d.t, d[key]);
+        if (first) { ctx.moveTo(x, y); first = false; }
+        else ctx.lineTo(x, y);
+      }
+      ctx.stroke();
+    };
+    drawSerie('down', 'solid');
+    drawSerie('up', 'dash');
+  }
+  ctx.setLineDash([]);
+
+  // 图例：每系列一个色块 + 模式/方向/时间
+  renderLegend(series);
+}
+
+/* 图例：下行/上行静态说明 + 各测试系列 */
+function renderLegend(series) {
+  const wrap = $('chartLegend');
+  if (!wrap) return;
+  let html = '<span class="dot down"></span>下行(实线) <span class="dot up"></span>上行(虚线)';
+  for (const s of series) {
+    const ts = new Date(s.ts).toLocaleTimeString();
+    html += ` <span class="series-tag" style="--sc:${s.color}">■ ${s.mode.toUpperCase()} ${dirText(s.dir)} ${ts}</span>`;
+  }
+  wrap.innerHTML = html;
+}
+
+function dirText(dir) {
+  return dir === 'up' ? '上行' : dir === 'down' ? '下行' : '双向';
+}
+
+function niceCeil(v) {
+  const p = Math.pow(10, Math.floor(Math.log10(v)));
+  const n = v / p;
+  if (n <= 1) return p;
+  if (n <= 2) return 2 * p;
+  if (n <= 5) return 5 * p;
+  return 10 * p;
+}
+function fmtRate(mbps) {
+  if (mbps >= 1000) return (mbps / 1000).toFixed(1) + 'G';
+  return mbps.toFixed(0) + 'M';
+}
+
+/* UI 刷新循环 */
+let uiTimer = null;
+function startUITimer() {
+  stopUITimer();
+  uiTimer = setInterval(() => {
+    if (!state.running) return;
+    // 触发所有 meter 采样（通过 meter.sample() 更新 live）
+    let totalDown = 0, totalUp = 0, totalRX = 0, totalTX = 0;
+    for (const m of live.meters.values()) {
+      if (m.sync) m.sync();  // 上行流：先校正为真实已发（send 缓冲已排空部分）
+      const s = m.sample();
+      if (s) { totalDown += s.downMbps; totalUp += s.upMbps; }
+      totalRX += m.rx;
+      totalTX += m.tx;
+    }
+    $('valDown').textContent = totalDown.toFixed(1);
+    $('valUp').textContent = totalUp.toFixed(1);
+    // 累计字节 + 进度
+    const el = $('liveDetail');
+    if (el) {
+      const t = Math.min((Date.now() - state.t0) / 1000, state.durations);
+      const pct = state.durations > 0 ? Math.round(t / state.durations * 100) : 0;
+      el.textContent =
+        `${state.phaseText || ''} ${pct}% · 已收 ${fmtBytes(totalRX)} · 已发 ${fmtBytes(totalTX)}`;
+      const bar = $('progressBar');
+      if (bar) bar.style.width = pct + '%';
+    }
+    const t = (Date.now() - state.t0) / 1000;
+    // 写入当前测试系列（缓存多轮测试曲线）
+    if (state.curSeries) state.curSeries.points.push({ t, down: totalDown, up: totalUp });
+    drawChart();
+  }, 100);
+}
+function stopUITimer() {
+  if (uiTimer) { clearInterval(uiTimer); uiTimer = null; }
+}
+
+/* ---------- 单个流的本地统计结果 ---------- */
+function makeStreamResult(meter, dir, duration, submitted, queued) {
+  // 依据方向取对应字节/速率
+  const dt = Math.max(duration || meter.elapsed(), 0.001);
+  const submittedBytes = submitted === undefined ? meter.tx : submitted;
+  const queuedBytes = Math.max(0, queued || 0);
+  const downBytes = meter.rx;
+  const upBytes = drainedBytes(submittedBytes, queuedBytes);
+  const total = dir === 'up' ? upBytes : dir === 'down' ? downBytes : upBytes + downBytes;
+  const downMbps = (downBytes / dt) * 8 / 1e6;
+  const upMbps = (upBytes / dt) * 8 / 1e6;
+  return {
+    totalBytes: total,
+    duration: dt,
+    avgMbitps: dir === 'up' ? upMbps : dir === 'down' ? downMbps : downMbps + upMbps,
+    peakMbitps: dir === 'up' ? meter.peakUp : dir === 'down' ? meter.peakDown : meter.peakDown + meter.peakUp,
+    packets: 0, lost: 0, lost_pct: 0, jitter_ms: 0,
+    upBytes, downBytes, downMbps, upMbps,
+    submittedBytes, queuedBytes, truncated: queuedBytes > 0,
+  };
+}
+
+/* ---------- TCP 测速（WebSocket） ---------- */
+function runTCPStream(cfg, streamId, doneCb) {
+  const q = new URLSearchParams({
+    mode: 'tcp', dir: cfg.dir, streams: cfg.streams,
+    duration: cfg.duration, packet_len: cfg.packetLen,
+  });
+  const url = `${cfg.wsBase}/ws/test?${q}`;
+  const ws = new WebSocket(url);
+  ws.binaryType = 'arraybuffer';
+  const meter = makeMeter();
+  live.add(streamId, meter);
+  state.streams.add(ws);
+  let sendTimer = null;
+  let finished = false;
+  let opened = false;      // 是否成功建立连接
+  let lastError = null;
+
+  const zeroBuf = new Uint8Array(cfg.packetLen);
+  let sentTotal = 0;   // 累计送入 send() 的字节
+  let srvResult = null; // 服务端最终统计（对账）
+
+  const finish = (err, res) => {
+    if (finished) return;
+    finished = true;
+    if (sendTimer) clearInterval(sendTimer);   // 停止发送（尾包留给网络排空）
+    try { meter.syncTX(sentTotal); } catch (e) {}
+    live.remove(streamId);
+    state.streams.delete(ws);
+    // 服务端 result 在停流后发出：不能立即 close(ws)，否则 result 丢失。
+    // 停发后保持连接，等服务端统计短暂到达（对账），超时则降级。
+    const finalize = () => {
+      try { ws.close(); } catch (e) {}
+      if (res && srvResult) res.srv = srvResult;
+      doneCb(err, res);
+    };
+    if (srvResult) { finalize(); return; }
+    const waitStart = Date.now();
+    const iv = setInterval(() => {
+      if (srvResult) {
+        clearInterval(iv);
+        finalize();
+      } else if (Date.now() - waitStart > 3000) {
+        clearInterval(iv);
+        finalize(); // 未拿到服务端统计，降级继续
+      }
+    }, 100);
+  };
+
+  ws.onmessage = (ev) => {
+    if (ev.data instanceof ArrayBuffer) {
+      meter.addRX(ev.data.byteLength); // 下行：收到即计数
+    } else if (typeof ev.data === 'string') {
+      let msg; try { msg = JSON.parse(ev.data); } catch (e) { return; }
+      if (msg.type === 'error') lastError = new Error(msg.error);
+      else if (msg.type === 'result' && msg.result) srvResult = msg.result;
+      // 忽略 sample（前端本地采样）；result 用于服务端对账
+    }
+  };
+
+  ws.onopen = () => {
+    opened = true;
+    if (cfg.dir === 'up' || cfg.dir === 'both') {
+      sendTimer = setInterval(() => {
+        if (ws.readyState !== WebSocket.OPEN) { clearInterval(sendTimer); return; }
+        while (ws.readyState === WebSocket.OPEN && ws.bufferedAmount < 16 * 1024 * 1024) {
+          ws.send(zeroBuf);
+          sentTotal += cfg.packetLen;
+          // 不在这里 addTX：等缓冲排空后由采样校正为真实已发
+        }
+      }, 0);
+      // 采样校正：真实已发 = 累计send − 缓冲滞留
+      meter.sync = () => meter.syncTX(sentTotal - (ws.readyState === WebSocket.OPEN ? ws.bufferedAmount : 0));
+    }
+  };
+
+  // 时长到时结束
+  setTimeout(() => {
+    if (ws.readyState === WebSocket.OPEN) {
+      // 结束前先让缓冲排空
+      finish(null, makeStreamResult(meter, cfg.dir));
+    }
+  }, cfg.duration * 1000 + 200);
+
+  ws.onclose = (ev) => {
+    if (!opened && !finished) {
+      // 连接从未建立成功：这是失败，不是 0 速结果
+      finish({
+        name: 'ConnectionError',
+        message: `无法连接测试服务器 (${url})\n请检查服务器地址、端口与网络。` +
+          (lastError ? `\n服务器返回: ${lastError.message}` : '') +
+          (ev.code ? `\nclose code=${ev.code}` : ''),
+      });
+      return;
+    }
+    if (finished) return;
+    if (lastError) {
+      finish(lastError);
+      return;
+    }
+    finish(null, makeStreamResult(meter, cfg.dir));
+  };
+  ws.onerror = (e) => { lastError = e && e.error ? e.error : null; };
+}
+
+function runTCP(cfg) {
+  return new Promise((resolve) => {
+    const results = [];
+    let pending = cfg.streams;
+    let failCount = 0;
+    const onDone = (err, res) => {
+      pending--;
+      if (err) { failCount++; results.push({ err, res: null }); }
+      else results.push({ err: null, res });
+      if (pending === 0) {
+        if (failCount === cfg.streams) {
+          // 全部失败：抛出一个汇总错误让 UI 显示原因
+          const first = results.find((r) => r.err);
+          resolve({ allFailed: true, message: first.err.message });
+        } else {
+          resolve(results);
+        }
+      }
+    };
+    for (let i = 0; i < cfg.streams; i++) runTCPStream(cfg, `tcp-${i}`, onDone);
+  });
+}
+
+/* ---------- UDP 测速（WebRTC DataChannel） ---------- */
+function runUDPStream(cfg, streamId, doneCb) {
+  const pc = new RTCPeerConnection({ iceServers: [] });
+  const meter = makeMeter();
+  live.add(streamId, meter);
+  state.streams.add(pc);
+  let sendTimer = null;
+  let finished = false;
+
+  const config = { ordered: false, maxRetransmits: 0 };
+  const dc = pc.createDataChannel('speedtest-' + streamId, config);
+
+  const signal = new WebSocket(`${cfg.wsBase}/ws/signal?dir=${cfg.dir}&duration=${cfg.duration}&packet_len=${cfg.packetLen}&stream_id=${streamId}`);
+  const zeroBuf = new Uint8Array(cfg.packetLen);
+  let sentTotal = 0;   // 累计送入 dc.send() 的字节
+  let srvResult = null; // 服务端最终统计（对账）
+
+  const finish = (err, res) => {
+    if (finished) return;
+    finished = true;
+    if (sendTimer) clearInterval(sendTimer);
+    try { meter.syncTX(sentTotal); } catch (e) {}
+    try { dc.close(); } catch (e) {}
+    try { pc.close(); } catch (e) {}
+    live.remove(streamId);
+    state.streams.delete(pc);
+    // 服务端 result 在停流后稍晚（~数百 ms）通过信令连接发送。
+    // 不能立即 close(signal)：先等 result 到达（对账），超时则降级。
+    const finalize = () => {
+      if (!res) { doneCb(err); return; }
+      if (srvResult) res.srv = srvResult;
+      doneCb(null, res);
+    };
+    if (srvResult) { finalize(); return; }
+    // 等待 result（最长 2.5s），期间不关闭信令
+    const waitStart = Date.now();
+    const iv = setInterval(() => {
+      if (srvResult) {
+        clearInterval(iv);
+        try { signal.close(); } catch (e) {}
+        finalize();
+      } else if (Date.now() - waitStart > 2500) {
+        clearInterval(iv);
+        try { signal.close(); } catch (e) {}
+        finalize(); // 未拿到服务端统计，降级继续
+      }
+    }, 100);
+  };
+
+  signal.onopen = async () => {
+    try {
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      signal.send(JSON.stringify({ type: 'offer', sdp: pc.localDescription.sdp }));
+    } catch (e) { finish(e); }
+  };
+  signal.onmessage = async (ev) => {
+    let msg; try { msg = JSON.parse(ev.data); } catch (e) { return; }
+    if (msg.type === 'answer') {
+      try { await pc.setRemoteDescription({ type: 'answer', sdp: msg.sdp }); }
+      catch (e) { finish(e); }
+    } else if (msg.type === 'error') {
+      finish(new Error('UDP 测速: ' + msg.error));
+    } else if (msg.type === 'result' && msg.result) {
+      srvResult = msg.result;  // 服务端对账统计
+    }
+  };
+  signal.onerror = (e) => { /* onclose 会跟随 */ };
+  signal.onclose = (ev) => {
+    if (!finished) {
+      // 区分：还没收到 answer 就关闭 = 信令失败；已收到 answer 正常关闭 = OK
+      finish(new Error(`UDP 信令连接异常关闭 (${ev && ev.code !== undefined ? 'code=' + ev.code : '未建立'})`));
+    }
+  };
+
+  dc.onopen = () => {
+    if (cfg.dir === 'up' || cfg.dir === 'both') {
+      sendTimer = setInterval(() => {
+        if (dc.readyState !== 'open') { clearInterval(sendTimer); return; }
+        while (dc.readyState === 'open' && dc.bufferedAmount < 8 * 1024 * 1024) {
+          dc.send(zeroBuf);
+          sentTotal += cfg.packetLen;
+        }
+      }, 0);
+      // 采样校正：真实已发 = 累计send − 缓冲滞留
+      meter.sync = () => meter.syncTX(sentTotal - (dc.readyState === 'open' ? dc.bufferedAmount : 0));
+    }
+  };
+  dc.onmessage = (ev) => {
+    if (ev.data instanceof ArrayBuffer) {
+      meter.addRX(ev.data.byteLength);
+    }
+  };
+  dc.onclose = () => { if (!finished) finish(null, makeStreamResult(meter, cfg.dir)); };
+  dc.onerror = () => {};
+
+  // 时长到时结束
+  setTimeout(() => {
+    if (dc.readyState === 'open') finish(null, makeStreamResult(meter, cfg.dir));
+  }, cfg.duration * 1000 + 300);
+}
+
+function runUDP(cfg) {
+  return new Promise((resolve) => {
+    const results = [];
+    let pending = cfg.streams;
+    const onDone = (err, res) => {
+      pending--;
+      results.push({ err, res });
+      if (pending === 0) resolve(results);
+    };
+    for (let i = 0; i < cfg.streams; i++) runUDPStream(cfg, `udp-${i}`, onDone);
+  });
+}
+
+/* ---------- 结果汇聚 ---------- */
+function aggregate(results, dir, phaseDuration) {
+  let totalBytes = 0, duration = 0, peakSum = 0;
+  let upBytes = 0, downBytes = 0;
+  let submittedBytes = 0, queuedBytes = 0, truncated = false;
+  // 服务端对账（双重统计）
+  let srvBytes = 0, srvAvg = 0, srvPeak = 0, srvCount = 0;
+  let srvSubmittedBytes = 0, srvQueuedBytes = 0;
+  let okCount = 0;
+  for (const r of results) {
+    if (!r || !r.res || r.err) continue;
+    okCount++;
+    const x = r.res;
+    totalBytes += x.totalBytes || 0;
+    duration = Math.max(duration, x.duration || 0);
+    peakSum += x.peakMbitps || 0;
+    upBytes += x.upBytes || 0;
+    downBytes += x.downBytes || 0;
+    submittedBytes += x.submittedBytes || 0;
+    queuedBytes += x.queuedBytes || 0;
+    truncated = truncated || Boolean(x.truncated);
+    // 服务端 stats（每个流一个 result，normalize 到相同本质单位后汇总）
+    if (x.srv) {
+      const s = x.srv;
+      srvBytes += s.total_bytes || 0;
+      srvAvg += s.avg_mbitps || 0;      // 服务端平均（MB/s→Mbit/s 单位一致）
+      srvPeak += s.peak_mbitps || 0;
+      srvSubmittedBytes += s.submitted_bytes || s.total_bytes || 0;
+      srvQueuedBytes += s.queued_bytes || 0;
+      truncated = truncated || Boolean(s.truncated);
+      srvCount++;
+    }
+  }
+  if (okCount === 0) return null;
+  if (phaseDuration > 0) duration = phaseDuration;
+  duration = Math.max(duration, 0.001);
+  const upMbps = upBytes * 8 / duration / 1e6;
+  const downMbps = downBytes * 8 / duration / 1e6;
+  const avgMbitps = dir === 'up' ? upMbps : dir === 'down' ? downMbps : upMbps + downMbps;
+  // 对账：双端统计差异 = 传输损耗/丢包的真实度量。
+  // - down: 服务端发出 > 客户端收到 → 丢包（unreliable 通道特征）
+  // - up:   客户端发出 > 服务端收到 → 丢包
+  // - both: 双方合计比较 → 总偏差
+  let lossPct = null, devPct = null;
+  if (srvCount && totalBytes > 0) {
+    const big = Math.max(totalBytes, srvBytes);
+    devPct = big > 0 ? (Math.abs(totalBytes - srvBytes) / big * 100) : 0;
+    if (dir === 'down' && srvBytes > 0) {
+      lossPct = Math.max(0, (srvBytes - totalBytes) / srvBytes * 100);
+    } else if (dir === 'up' && totalBytes > 0) {
+      lossPct = Math.max(0, (totalBytes - srvBytes) / totalBytes * 100);
+    }
+  }
+  return {
+    totalBytes, duration,
+    avgMbitps,
+    peakMbitps: peakSum,
+    upBytes, downBytes, upMbps, downMbps,
+    submittedBytes, queuedBytes, truncated,
+    streams: okCount,
+    jitter: 0,
+    // 对账：lossPct=方向性丢包率，devPct=双端总偏差
+    srvBytes: srvCount ? srvBytes : null,
+    srvAvg: srvCount ? srvAvg : null,
+    srvPeak: srvCount ? srvPeak : null,
+    srvSubmittedBytes: srvCount ? srvSubmittedBytes : null,
+    srvQueuedBytes: srvCount ? srvQueuedBytes : null,
+    lossPct, devPct,
+  };
+}
+
+function addResultRow(mode, dir, r) {
+  const tbody = document.querySelector('#resultTable tbody');
+  const tr = document.createElement('tr');
+  tr.className = mode === 'tcp' ? 'row-tcp' : 'row-udp';
+  tr.dataset.key = `${mode}|${dir}`;
+  const dTxt = dirText(dir) + (dir === 'up' ? ' ▲' : dir === 'down' ? ' ▼' : ' ⇅');
+  // 双向时分别展示上下行速率
+  let avgCell = `${(r.avgMbitps).toFixed(1)} Mbit/s`;
+  if (dir === 'both') {
+    avgCell = `▼ ${(r.downMbps).toFixed(1)} / ▲ ${(r.upMbps).toFixed(1)} Mbit/s`;
+  }
+  const timeCell = new Date().toLocaleTimeString();
+  // 丢包率：UDP 有对账时显示真实丢包率（双端统计差值），否则 0%
+  // TCP 走可靠通道，丢包率恒 0%（重传在协议内消化）；对账偏差在明细行分级警示
+  let lostCell = mode === 'udp' && r.lossPct !== null && r.lossPct !== undefined
+    ? r.lossPct.toFixed(1) + '%' : '0%';
+  let lostCls = '';
+  if (mode === 'udp' && r.lossPct !== null && r.lossPct !== undefined) {
+    lostCls = r.lossPct > 30 ? 'num-bad' : r.lossPct > 5 ? 'num-warn' : 'num-ok';
+  }
+  const jitterCell = (r.jitter || 0).toFixed(1) + ' ms';
+  // 主行：每个 td 带 data-label，手机竖屏下 CSS 卡片化时展示列名
+  tr.innerHTML = `
+    <td data-label="链路">${mode.toUpperCase()}</td>
+    <td data-label="方向">${dTxt}</td>
+    <td data-label="平均">${avgCell}</td>
+    <td data-label="峰值">${(r.peakMbitps).toFixed(1)} Mbit/s</td>
+    <td data-label="总传输">${fmtBytes(r.totalBytes)}</td>
+    <td data-label="丢包率" class="${lostCls}">${lostCell}</td>
+    <td data-label="抖动">${jitterCell}</td>
+    <td data-label="用时">${r.duration.toFixed(1)} s</td>
+    <td data-label="时间" class="time">${timeCell}</td>`;
+  tbody.appendChild(tr);
+  // 附加信息行：流数 + 字节明细 + 服务端对账（偏差分级警示）
+  const detail = document.createElement('tr');
+  detail.className = 'row-detail';
+  detail.dataset.key = `${mode}|${dir}`;
+  let detailTxt = `${r.streams} 条并行流 · ` +
+    `下行 ${fmtBytes(r.downBytes)}${dir === 'both' ? ' · 上行 ' + fmtBytes(r.upBytes) : ''}`;
+  if (r.srvBytes !== null && r.srvBytes !== undefined) {
+    const dev = (r.devPct !== null && r.devPct !== undefined) ? r.devPct : 0;
+    // 分级：<5% 正常 / 5-30% 警告 / >30% 异常（数据不可信）
+    let grade, gradeCls;
+    if (dev < 5) { grade = '对账正常'; gradeCls = 'rec-ok'; }
+    else if (dev < 30) { grade = '偏差较大'; gradeCls = 'rec-warn'; }
+    else { grade = '严重损耗 ⚠'; gradeCls = 'rec-bad'; }
+    let warnNote = '';
+    if (dev >= 5) {
+      warnNote = mode === 'udp'
+        ? ` · 双端统计相差 ${dev.toFixed(1)}%（unreliable 通道丢包所致，结果仅供参考）`
+        : ` · 双端统计相差 ${dev.toFixed(1)}%（TCP 不应丢包，请检查网络/缓冲截断）`;
+    }
+    detailTxt += ` · <span class="srv-rec">服务器对账: 传输 ${fmtBytes(r.srvBytes)} · ` +
+      `平均 ${(r.srvAvg).toFixed(1)} Mbit/s · 峰值 ${(r.srvPeak).toFixed(1)} Mbit/s · ` +
+      `<span class="${gradeCls}">${grade}</span>${warnNote}</span>`;
+  } else {
+    detailTxt += ' · <span class="srv-rec" style="opacity:.6">服务器统计未返回</span>';
+  }
+  detail.innerHTML = `<td colspan="9" style="color:var(--muted);font-size:12px;text-align:left;padding-top:0">${detailTxt}</td>`;
+  tbody.appendChild(detail);
+}
+
+// 重新测试同链路时替换旧结果行（主行+明细行）
+function removeResultRow(mode, dir) {
+  const key = `${mode}|${dir}`;
+  const tbody = document.querySelector('#resultTable tbody');
+  for (const tr of [...tbody.querySelectorAll('tr')]) {
+    if (tr.dataset.key === key) tr.remove();
+  }
+}
+
+function fmtBytes(b) {
+  if (b >= 1 << 30) return (b / (1 << 30)).toFixed(2) + ' GiB';
+  if (b >= 1 << 20) return (b / (1 << 20)).toFixed(2) + ' MiB';
+  if (b >= 1 << 10) return (b / (1 << 10)).toFixed(1) + ' KiB';
+  return b + ' B';
+}
+
+/* 历史记录 */
+function saveHistory(entry) {
+  const key = 'speedtest-history';
+  let hist = [];
+  try { hist = JSON.parse(localStorage.getItem(key) || '[]'); } catch (e) {}
+  hist.unshift(entry);
+  hist = hist.slice(0, 20);
+  localStorage.setItem(key, JSON.stringify(hist));
+  renderHistory();
+}
+function renderHistory() {
+  const key = 'speedtest-history';
+  let hist = [];
+  try { hist = JSON.parse(localStorage.getItem(key) || '[]'); } catch (e) {}
+  const wrap = $('historyWrap');
+  const ul = $('history');
+  if (!hist.length) { wrap.hidden = true; return; }
+  wrap.hidden = false;
+  ul.innerHTML = '';
+  for (const h of hist) {
+    const li = document.createElement('li');
+    li.textContent = `${new Date(h.ts).toLocaleTimeString()} · ${h.mode.toUpperCase()} ${h.dir} · ` +
+      `平均 ${h.avgMbitps.toFixed(1)} Mbit/s`;
+    ul.appendChild(li);
+  }
+}
+
+/* ---------- 主流程 ---------- */
+const SERIES_COLORS = ['#38bdf8', '#fbbf24', '#a78bfa', '#34d399', '#fb7185', '#f97316', '#22d3ee', '#a3e635'];
+
+function ensureSeries(mode, dir) {
+  // 同一 (链路+方向) 重新测试 → 替换旧系列；不同项 → 缓存追加
+  const key = `${mode}|${dir}`;
+  const now = Date.now();
+  for (let i = state.series.length - 1; i >= 0; i--) {
+    if (state.series[i].key === key) state.series.splice(i, 1);
+  }
+  const color = SERIES_COLORS[state.series.length % SERIES_COLORS.length];
+  const series = { key, id: now, mode, dir, ts: now, color, points: [] };
+  state.series.push(series);
+  return series;
+}
+
+async function start() {
+  if (state.running) return;
+  const cfg = getConfig();
+  $('serverHost').textContent = cfg.server;
+  // 结果表：不清空，缓存展示。重新测同项时替换对应行。
+  live.reset();
+  state.t0 = Date.now();
+  state.durations = cfg.duration;
+  setRunning(true);
+  startUITimer();
+  $('valDown').textContent = '0.0';
+  $('valUp').textContent = '0.0';
+
+  const modes = cfg.mode === 'both' ? ['tcp', 'udp'] : [cfg.mode];
+  try {
+    for (const mode of modes) {
+      // each 实际链路单独一条缓存曲线
+      removeResultRow(mode, cfg.dir);
+      state.curSeries = ensureSeries(mode, cfg.dir);
+      renderLegend(state.series);
+      state.phaseText = `正在测试 ${mode.toUpperCase()} · ${cfg.dir === 'up' ? '上行' : cfg.dir === 'down' ? '下行' : '双向'}`;
+      const results = (mode === 'tcp') ? await runTCP(cfg) : await runUDP(cfg);
+      if (results && results.allFailed) {
+        throw new Error(results.message || `所有 ${mode.toUpperCase()} 流均失败`);
+      }
+      const agg = aggregate(results, cfg.dir);
+      addResultRow(mode, cfg.dir, agg);
+      saveHistory({ ts: Date.now(), mode, dir: cfg.dir, avgMbitps: agg.avgMbitps });
+    }
+    state.curSeries = null;
+    state.phaseText = '测试完成';
+  } catch (err) {
+    console.error(err);
+    const tbody = document.querySelector('#resultTable tbody');
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td colspan="8" style="color:var(--red)">测速失败: ${(err.message || '').replace(/\n/g, '<br>')}</td>`;
+    tbody.appendChild(tr);
+  } finally {
+    for (const s of state.streams) {
+      try { if (typeof s.close === 'function') s.close(); } catch (e) {}
+    }
+    state.streams.clear();
+    setRunning(false);
+    stopUITimer();
+    drawChart();
+  }
+}
+
+function stop() {
+  for (const s of state.streams) {
+    try { if (typeof s.close === 'function') s.close(); } catch (e) {}
+  }
+  state.streams.clear();
+  live.reset();
+}
+
+/* 刷新清空：手动清掉缓存的曲线与结果（history 本地历史保持） */
+function refreshAll() {
+  state.series = [];
+  document.querySelector('#resultTable tbody').innerHTML = '';
+  $('valDown').textContent = '0.0';
+  $('valUp').textContent = '0.0';
+  const el = $('liveDetail');
+  if (el) {
+    el.textContent = '就绪';
+    const bar = $('progressBar');
+    if (bar) bar.style.width = '0%';
+  }
+  drawChart();  // 内部会 renderLegend([])
+}
+
+/* ---------- 画布自适应（手机竖屏） ---------- */
+// 桌面保持 1100×300；窄屏（<700px）按容器宽度重设画布实际像素，
+// 并保持一个适合竖屏的宽高比，文字随画布重绘而不缩小变形。
+function fitChartToViewport() {
+  const canvas = $('chart');
+  if (!canvas) return;
+  const w = canvas.clientWidth || canvas.parentElement.clientWidth;
+  if (w < 10) return;
+  if (w < 700) {
+    const targetW = Math.round(w);
+    const targetH = Math.max(170, Math.round(w * 0.62)); // 竖屏比例，避免过矮
+    if (canvas.width !== targetW || canvas.height !== targetH) {
+      canvas.width = targetW;
+      canvas.height = targetH;
+      drawChart(); // canvas 尺寸变了，按新尺寸重绘
+    }
+  } else if (canvas.width !== 1100 || canvas.height !== 300) {
+    canvas.width = 1100;
+    canvas.height = 300;
+    drawChart();
+  }
+}
+
+/* ---------- 绑定 ---------- */
+document.addEventListener('DOMContentLoaded', () => {
+  $('serverHost').textContent = location.host;
+  $('btnStart').addEventListener('click', start);
+  $('btnStop').addEventListener('click', stop);
+  $('btnRefresh').addEventListener('click', refreshAll);
+  $('btnClearHistory').addEventListener('click', () => {
+    localStorage.removeItem('speedtest-history');
+    renderHistory();
+  });
+  renderHistory();
+  fitChartToViewport();
+  drawChart();
+  window.addEventListener('resize', () => { fitChartToViewport(); });
+});
+
+// 调试/测试钩子（对前端无副作用）
+if (typeof window !== 'undefined' && window !== undefined) {
+  window.__speedTestCore = { aggregate, addResultRow, removeResultRow, drainedBytes, makeStreamResult };
+}
+
+})();
