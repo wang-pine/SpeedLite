@@ -215,6 +215,68 @@ test('TCP upload starts on server start and completes only on result', async (t)
   assert.ok(done[0].result.srv);
 });
 
+test('TCP upload sends stop synchronously even when bufferedAmount never accumulates', async (t) => {
+  // 高速通道：send() 不累计 bufferedAmount（恒 0）。旧实现里 while 打流永不退出、
+  // 事件循环被占死，setTimeout(stop) 被饿死 → 服务端等满 watchdog 后断开（用户报的
+  // "TCP 测速超时：服务端未返回最终统计"）。修复必须让 stop 在打流回调内同步发出。
+  class FastWebSocket {
+    static CONNECTING = 0;
+    static OPEN = 1;
+    static CLOSED = 3;
+    static instances = [];
+
+    constructor(url) {
+      this.url = url;
+      this.readyState = FastWebSocket.CONNECTING;
+      this.bufferedAmount = 0;
+      this.sent = [];
+      FastWebSocket.instances.push(this);
+    }
+
+    send(data) {
+      this.sent.push(data);
+      // 故意不累计 bufferedAmount —— while 循环只在 deadline 处退出
+    }
+
+    close() {
+      if (this.readyState === FastWebSocket.CLOSED) return;
+      this.readyState = FastWebSocket.CLOSED;
+      if (this.onclose) this.onclose({ code: 1000 });
+    }
+  }
+  context.WebSocket = FastWebSocket;
+
+  const done = [];
+  core.runTCPStream({
+    dir: 'up',
+    streams: 1,
+    duration: 0.02,
+    packetLen: 1024,
+    wsBase: 'ws://test.invalid',
+  }, 'tcp-fast', (err, result) => done.push({ err, result }));
+
+  const ws = FastWebSocket.instances[0];
+  t.after(() => {
+    if (ws.readyState !== FastWebSocket.CLOSED) {
+      ws.onmessage({ data: JSON.stringify({
+        type: 'result',
+        result: { total_bytes: 0, duration: 0.02, avg_mbitps: 0, peak_mbitps: 0 },
+      }) });
+      ws.close();
+    }
+  });
+
+  ws.readyState = FastWebSocket.OPEN;
+  ws.onopen();
+  ws.onmessage({ data: JSON.stringify({ type: 'start' }) });
+
+  // 打流 while 在 deadline 处退出并同步发 stop；不依赖 setTimeout 调度。
+  await wait(120);
+  const stop = ws.sent.find((item) => typeof item === 'string' && JSON.parse(item).type === 'stop');
+  assert.ok(stop, 'fast channel must still enqueue stop synchronously at deadline');
+  assert.equal(done.length, 0, 'stop alone must not complete the stream');
+});
+
 test('TCP disconnect before result fails exactly once', () => {
   class ClosingWebSocket {
     static CONNECTING = 0;
@@ -511,4 +573,51 @@ test('UDP upload detail uses browser submitted and drained bytes', () => {
   assert.match(html, /排空 8\.00 MiB/);
   assert.match(html, /接收 6\.00 MiB/);
   assert.match(html, /残留 2\.00 MiB/);
+});
+
+test('aggregate carries packet meta and result row key is packet-aware', () => {
+  const rows = [];
+  const tbody = {
+    appendChild(element) { rows.push(element); },
+    querySelectorAll() { return rows; },
+  };
+  document.querySelector = (selector) => {
+    assert.equal(selector, '#resultTable tbody');
+    return tbody;
+  };
+  document.createElement = () => ({ className: '', dataset: {}, innerHTML: '' });
+
+  // aggregate 带包长 meta，返回应携带包长字段
+  const agg = core.aggregate([{
+    err: null,
+    res: {
+      totalBytes: MiB, duration: 1, avgMbitps: 8, peakMbitps: 9,
+      upBytes: 0, downBytes: MiB, downMbps: 8, upMbps: 0,
+    },
+  }], 'down', 1, 9, {
+    packetLen: 1400, packetLabel: '固定·类720p 1400B',
+    packetKind: 'fixed', packetSizes: null,
+  });
+  assert.equal(agg.packetLen, 1400);
+  assert.equal(agg.packetKind, 'fixed');
+  assert.equal(agg.packetLabel, '固定·类720p 1400B');
+
+  // 结果行 key 应包含包长（mode|dir|pktKey），不同包长互不覆盖
+  core.addResultRow('udp', 'down', {
+    avgMbitps: 8, peakMbitps: 9, totalBytes: MiB, duration: 1,
+    streams: 1, upBytes: 0, downBytes: MiB, downMbps: 8, upMbps: 0,
+    lossPct: 0, srvBytes: MiB, srvAvg: 8, srvPeak: 9,
+    packetKind: 'fixed', packetLen: 1400, packetLabel: '固定·类720p 1400B',
+  });
+  assert.equal(rows[0].dataset.key, 'udp|down|fixed|1400');
+
+  // 动态包长也有独立 key
+  rows.length = 0;
+  core.addResultRow('udp', 'down', {
+    avgMbitps: 8, peakMbitps: 9, totalBytes: MiB, duration: 1,
+    streams: 1, upBytes: 0, downBytes: MiB, downMbps: 8, upMbps: 0,
+    lossPct: 0, srvBytes: MiB, srvAvg: 8, srvPeak: 9,
+    packetKind: 'dynamic', packetLen: 512, packetLabel: '动态·媒体混合 512/1200/1400/1500B',
+  });
+  assert.equal(rows[0].dataset.key, 'udp|down|dynamic|512');
 });

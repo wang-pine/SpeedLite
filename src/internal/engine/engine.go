@@ -33,6 +33,8 @@ type Params struct {
 	Streams   int       `json:"streams"`    // 并行流数
 	Duration  float64   `json:"duration"`   // 秒
 	PacketLen int       `json:"packet_len"` // 帧/包大小（字节）
+	PacketKind string   `json:"packet_kind,omitempty"`  // fixed | dynamic
+	PacketSizes []int   `json:"packet_sizes,omitempty"` // 动态包长轮换序列（bytes）
 	NoTLS     bool      `json:"-"`          // CLI 用：是否关闭 TLS
 	Server    string    `json:"-"`          // CLI 用：目标地址
 }
@@ -90,6 +92,10 @@ type Sampler struct {
 	lastTime time.Time
 	peak     float64
 	samples  []Sample
+	// 峰值平滑：保存最近若干窗口的瞬时速率，峰值取这些窗口的滑动平均最大值，
+	// 避免单窗口突发导致峰值虚高（如小包高 pps 下瞬时速率远超真实链路带宽）。
+	rateWin []float64
+	peakOn  bool // 是否已启用峰值平滑（window>0）
 }
 
 // NewSampler 创建采样器。window 为采样窗口（如 100ms）。
@@ -133,11 +139,34 @@ func (s *Sampler) Tick() {
 		RateMBps: rate,
 		RateMbps: rate * 8,
 	})
-	if rate > s.peak {
+	// 峰值平滑：把本窗口速率加入滑动窗口（窗口数=1s/window），
+	// 每加入一个窗口就重算该窗口内平均，峰值取“最近 1s 滑动平均”的最大值。
+	if s.window > 0 {
+		s.rateWin = append(s.rateWin, rate)
+		winN := int((time.Second + s.window - 1) / s.window) // 约 1s 的窗口数
+		if len(s.rateWin) > winN {
+			s.rateWin = s.rateWin[len(s.rateWin)-winN:]
+		}
+		avg := avgOf(s.rateWin)
+		if avg > s.peak {
+			s.peak = avg
+		}
+	} else if rate > s.peak {
 		s.peak = rate
 	}
 	s.last = s.bytes
 	s.lastTime = now
+}
+
+func avgOf(vals []float64) float64 {
+	if len(vals) == 0 {
+		return 0
+	}
+	sum := 0.0
+	for _, v := range vals {
+		sum += v
+	}
+	return sum / float64(len(vals))
 }
 
 // Elapsed 返回已运行秒数。

@@ -1,10 +1,10 @@
-// Command speedctl 是测速 CLI 客户端：用原生 TCP/UDP socket 测量到服务器的上下行带宽。
+// Command speedlite-cli 是测速 CLI 客户端：用原生 TCP/UDP socket 测量到服务器的上下行带宽。
 //
 // 用法（flags 可放在任意位置，包括位置参数之后）：
 //
-//	speedctl -s host:port [mode] [direction] [flags]
-//	speedctl -s 192.168.1.10 tcp up -P 8 -t 5 -l 65536
-//	speedctl -s 192.168.1.10 tcp down -t 5 -P 4
+//	speedlite-cli -s host:port [mode] [direction] [flags]
+//	speedlite-cli -s 192.168.1.10 tcp up -P 8 -t 5 -l 65536
+//	speedlite-cli -s 192.168.1.10 tcp down -t 5 -P 4
 //
 // 位置参数：mode=tcp|udp（默认 tcp），direction=up|down（默认 up）。
 // 服务器端口约定：tcp 用 -tcp-port（默认 5001），udp 用 -udp-port（默认 5201）。
@@ -24,12 +24,12 @@ import (
 	"sync"
 	"time"
 
-	"speedTest/internal/engine"
-	"speedTest/internal/version"
+	"speedlite/internal/engine"
+	"speedlite/internal/version"
 )
 
 // options 用简化自定义解析（标准 flag 包遇到首个位置参数就停止解析，
-// 无法支持 "speedctl tcp down -P 8" 这种混合写法）。
+// 无法支持 "speedlite-cli tcp down -P 8" 这种混合写法）。
 type options struct {
 	server    string
 	tcpPort   int
@@ -143,8 +143,8 @@ func parseArgs(args []string) (options, []string, error) {
 var errHelp = fmt.Errorf("help requested")
 
 func usage() {
-	fmt.Fprintf(os.Stderr, "speedctl - 用原生 socket 测量 TCP/UDP 上下行带宽\n\n")
-	fmt.Fprintf(os.Stderr, "用法:\n  speedctl -s host:port [tcp|udp] [up|down] [flags]\n\n")
+	fmt.Fprintf(os.Stderr, "speedlite-cli - 用原生 socket 测量 TCP/UDP 上下行带宽\n\n")
+	fmt.Fprintf(os.Stderr, "用法:\n  speedlite-cli -s host:port [tcp|udp] [up|down] [flags]\n\n")
 	fmt.Fprintf(os.Stderr, "位置参数:\n  mode       tcp|udp（默认 tcp）\n  direction  up|down（默认 up）\n\n")
 	fmt.Fprintf(os.Stderr, "Flags:\n")
 	fmt.Fprintf(os.Stderr, "  -s <host:port>   服务器地址（默认 127.0.0.1:5001）\n")
@@ -160,7 +160,7 @@ func main() {
 	// -version / --version 直接退出
 	for _, a := range os.Args[1:] {
 		if a == "-version" || a == "--version" {
-			fmt.Printf("speedctl %s\n", version.Version)
+			fmt.Printf("speedlite-cli %s\n", version.Version)
 			os.Exit(0)
 		}
 	}
@@ -207,7 +207,7 @@ func main() {
 		os.Exit(2)
 	}
 
-	fmt.Printf("speedctl → %s\n模式=%s 方向=%s 流数=%d 时长=%.1fs 包大小=%dB\n\n",
+	fmt.Printf("speedlite-cli → %s\n模式=%s 方向=%s 流数=%d 时长=%.1fs 包大小=%dB\n\n",
 		opts.server, p.Mode, p.Direction, p.Streams, p.Duration, p.PacketLen)
 
 	var wg sync.WaitGroup

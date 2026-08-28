@@ -13,7 +13,7 @@
 - 多流结果的平均速率和峰值汇总。
 - 服务端统计返回结构、页面文案、用户手册和自动化回归测试。
 
-原生 `speedctl` 的 TCP/UDP 协议不变。网页 UDP 不宣称测得 IP 层 UDP 包丢失率；原生 `speedctl udp` 继续负责带序号的精确包丢失与抖动统计。
+原生 `speedlite-cli` 的 TCP/UDP 协议不变。网页 UDP 不宣称测得 IP 层 UDP 包丢失率；原生 `speedlite-cli udp` 继续负责带序号的精确包丢失与抖动统计。
 
 ## 设计原则
 
@@ -86,7 +86,7 @@ WebRTC unreliable DataChannel 无法提供 TCP 式交付确认。因此页面保
 - 上行：`max(0, 浏览器已排空字节 - 服务端接收字节) / 浏览器已排空字节`。
 - 排队残留不进入交付损失分子或分母，单独标记为“队列截断”。
 
-该值表示 WebRTC 应用层消息的交付差额，可能包含 SCTP/DTLS/UDP 路径上的丢弃，不能解释为 IP 层 UDP 包丢失率。精确包丢失率和抖动继续由 `speedctl udp` 提供。
+该值表示 WebRTC 应用层消息的交付差额，可能包含 SCTP/DTLS/UDP 路径上的丢弃，不能解释为 IP 层 UDP 包丢失率。精确包丢失率和抖动继续由 `speedlite-cli udp` 提供。
 
 ## 统计结构
 
@@ -102,7 +102,7 @@ WebRTC unreliable DataChannel 无法提供 TCP 式交付确认。因此页面保
 
 ## 浏览器统计模块
 
-将纯计算从传输流程中抽出，作为 `window.__speedTestCore` 可测试接口：
+将纯计算从传输流程中抽出，作为 `window.__speedliteCore` 可测试接口：
 
 - `drainedBytes(submitted, queued)`：返回非负的已排空字节。
 - `makeStreamResult(...)`：以明确的开始/结束时间和方向字节生成单流结果。
@@ -172,4 +172,4 @@ WebRTC unreliable DataChannel 无法提供 TCP 式交付确认。因此页面保
 
 ## 兼容性与部署
 
-网页前端与服务端由同一 Go 二进制内嵌交付，因此 WebSocket/WebRTC 控制协议同步升级，不提供跨版本网页与服务端兼容保证。部署后必须强制刷新浏览器缓存。原生 `speedctl` 协议保持兼容。
+网页前端与服务端由同一 Go 二进制内嵌交付，因此 WebSocket/WebRTC 控制协议同步升级，不提供跨版本网页与服务端兼容保证。部署后必须强制刷新浏览器缓存。原生 `speedlite-cli` 协议保持兼容。

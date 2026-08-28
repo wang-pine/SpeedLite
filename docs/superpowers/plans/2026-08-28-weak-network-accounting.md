@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- Do not change the native `speedctl` TCP or UDP wire protocols.
+- Do not change the native `speedlite-cli` TCP or UDP wire protocols.
 - Do not add npm dependencies; frontend tests use Node built-ins only.
 - Browser UDP reports application-layer delivery loss, not IP-layer packet loss or jitter.
 - A browser stream without a server result is a failed stream, never a successful local-only estimate.
@@ -25,14 +25,14 @@
 ### Task 1: Pure accounting helpers and aggregate invariants
 
 **Files:**
-- Create: `src/cmd/speedtest-server/web/app.test.mjs`
-- Modify: `src/cmd/speedtest-server/web/app.js:58-105,264-280,524-580`
+- Create: `src/cmd/speedlite-server/web/app.test.mjs`
+- Modify: `src/cmd/speedlite-server/web/app.js:58-105,264-280,524-580`
 
 **Interfaces:**
 - Produces: `drainedBytes(submitted: number, queued: number): number`.
 - Produces: `makeStreamResult(meter, dir, duration, submittedBytes?, queuedBytes?): StreamResult`.
 - Produces: `aggregate(results, dir, phaseDuration?): AggregateResult`.
-- Exposes these functions through `window.__speedTestCore`.
+- Exposes these functions through `window.__speedliteCore`.
 
 - [ ] **Step 1: Write the frontend harness and failing queued-byte test**
 
@@ -47,7 +47,7 @@ test('drainedBytes excludes queued data without underflow', () => {
 
 - [ ] **Step 2: Run RED**
 
-Run: `cd src && node --test cmd/speedtest-server/web/app.test.mjs`
+Run: `cd src && node --test cmd/speedlite-server/web/app.test.mjs`
 
 Expected: FAIL because `core.drainedBytes` is missing.
 
@@ -61,7 +61,7 @@ function drainedBytes(submitted, queued) {
 
 - [ ] **Step 4: Run GREEN**
 
-Run: `cd src && node --test cmd/speedtest-server/web/app.test.mjs`
+Run: `cd src && node --test cmd/speedlite-server/web/app.test.mjs`
 
 Expected: PASS.
 
@@ -71,7 +71,7 @@ Create two successful stream results totaling 8 MiB over a shared 8-second phase
 
 - [ ] **Step 6: Run RED**
 
-Run: `cd src && node --test cmd/speedtest-server/web/app.test.mjs`
+Run: `cd src && node --test cmd/speedlite-server/web/app.test.mjs`
 
 Expected: FAIL because current `aggregate()` sums per-stream averages.
 
@@ -83,13 +83,13 @@ Use `phaseDuration` when supplied, otherwise the maximum successful stream durat
 
 Assert that UDP down with 10 MiB submitted, 4 MiB queued, and 5 MiB received uses 6 MiB drained, reports `1/6 × 100` delivery loss, exposes 4 MiB queued, and sets `truncated=true`.
 
-Run: `cd src && node --test cmd/speedtest-server/web/app.test.mjs`
+Run: `cd src && node --test cmd/speedlite-server/web/app.test.mjs`
 
 Expected: all tests PASS.
 
 - [ ] **Step 9: Commit Task 1**
 
-Run: `git add src/cmd/speedtest-server/web/app.js src/cmd/speedtest-server/web/app.test.mjs && git commit -m "fix: make browser accounting queue-aware"`
+Run: `git add src/cmd/speedlite-server/web/app.js src/cmd/speedlite-server/web/app.test.mjs && git commit -m "fix: make browser accounting queue-aware"`
 
 ---
 
@@ -98,8 +98,8 @@ Run: `git add src/cmd/speedtest-server/web/app.js src/cmd/speedtest-server/web/a
 **Files:**
 - Create: `src/internal/wsstream/wsstream_test.go`
 - Modify: `src/internal/wsstream/wsstream.go:112-253`
-- Modify: `src/cmd/speedtest-server/web/app.js:282-407`
-- Modify: `src/cmd/speedtest-server/web/app.test.mjs`
+- Modify: `src/cmd/speedlite-server/web/app.js:282-407`
+- Modify: `src/cmd/speedlite-server/web/app.test.mjs`
 
 **Interfaces:**
 - Consumes: Task 1 accounting helpers.
@@ -150,7 +150,7 @@ Start timers only after server start. At duration, stop enqueueing and send stop
 
 - [ ] **Step 10: Run frontend and server GREEN**
 
-Run: `cd src && node --test cmd/speedtest-server/web/app.test.mjs`
+Run: `cd src && node --test cmd/speedlite-server/web/app.test.mjs`
 
 Run: `cd src && go test ./internal/wsstream -count=1`
 
@@ -158,7 +158,7 @@ Expected: all tests PASS.
 
 - [ ] **Step 11: Commit Task 2**
 
-Run: `git add src/internal/wsstream/wsstream.go src/internal/wsstream/wsstream_test.go src/cmd/speedtest-server/web/app.js src/cmd/speedtest-server/web/app.test.mjs && git commit -m "fix: align websocket accounting boundaries"`
+Run: `git add src/internal/wsstream/wsstream.go src/internal/wsstream/wsstream_test.go src/cmd/speedlite-server/web/app.js src/cmd/speedlite-server/web/app.test.mjs && git commit -m "fix: align websocket accounting boundaries"`
 
 ---
 
@@ -169,8 +169,8 @@ Run: `git add src/internal/wsstream/wsstream.go src/internal/wsstream/wsstream_t
 - Modify: `src/internal/engine/engine_test.go`
 - Create: `src/internal/rtcbridge/accounting_test.go`
 - Modify: `src/internal/rtcbridge/rtcbridge.go:32-224`
-- Modify: `src/cmd/speedtest-server/web/app.js:409-522`
-- Modify: `src/cmd/speedtest-server/web/app.test.mjs`
+- Modify: `src/cmd/speedlite-server/web/app.js:409-522`
+- Modify: `src/cmd/speedlite-server/web/app.test.mjs`
 
 **Interfaces:**
 - Extends `engine.Stats` with `SubmittedBytes`, `QueuedBytes`, `UpBytes`, `DownBytes`, and `Truncated`.
@@ -223,7 +223,7 @@ With fake DataChannel/signaling objects, assert queued bytes are excluded, stop 
 
 - [ ] **Step 10: Run Task 3 suites**
 
-Run: `cd src && node --test cmd/speedtest-server/web/app.test.mjs`
+Run: `cd src && node --test cmd/speedlite-server/web/app.test.mjs`
 
 Run: `cd src && go test ./internal/engine ./internal/rtcbridge -count=1`
 
@@ -231,16 +231,16 @@ Expected: all tests PASS.
 
 - [ ] **Step 11: Commit Task 3**
 
-Run: `git add src/internal/engine/engine.go src/internal/engine/engine_test.go src/internal/rtcbridge/rtcbridge.go src/internal/rtcbridge/accounting_test.go src/cmd/speedtest-server/web/app.js src/cmd/speedtest-server/web/app.test.mjs && git commit -m "fix: report webrtc drain and delivery accounting"`
+Run: `git add src/internal/engine/engine.go src/internal/engine/engine_test.go src/internal/rtcbridge/rtcbridge.go src/internal/rtcbridge/accounting_test.go src/cmd/speedlite-server/web/app.js src/cmd/speedlite-server/web/app.test.mjs && git commit -m "fix: report webrtc drain and delivery accounting"`
 
 ---
 
 ### Task 4: UI semantics, docs, and full verification
 
 **Files:**
-- Modify: `src/cmd/speedtest-server/web/index.html:91-110`
-- Modify: `src/cmd/speedtest-server/web/app.js:582-642`
-- Modify: `src/cmd/speedtest-server/web/style.css:148-160`
+- Modify: `src/cmd/speedlite-server/web/index.html:91-110`
+- Modify: `src/cmd/speedlite-server/web/app.js:582-642`
+- Modify: `src/cmd/speedlite-server/web/style.css:148-160`
 - Modify: `README.md`
 - Modify: `docs/用户手册.md`
 
@@ -254,7 +254,7 @@ Assert TCP 0.5% is normal, TCP 1.2% is abnormal, UDP residual renders delivery l
 
 - [ ] **Step 2: Run RED**
 
-Run: `cd src && node --test cmd/speedtest-server/web/app.test.mjs`
+Run: `cd src && node --test cmd/speedlite-server/web/app.test.mjs`
 
 Expected: FAIL on old labels and thresholds.
 
@@ -264,7 +264,7 @@ Render submitted/drained/received/residual values, use the 1% TCP threshold, ren
 
 - [ ] **Step 4: Run rendering GREEN**
 
-Run: `cd src && node --test cmd/speedtest-server/web/app.test.mjs`
+Run: `cd src && node --test cmd/speedlite-server/web/app.test.mjs`
 
 Expected: PASS.
 
@@ -278,11 +278,11 @@ Run: `cd src && gofmt -w internal/engine/engine.go internal/engine/engine_test.g
 
 Run: `cd src && go test ./... -count=1`
 
-Run: `cd src && node --check cmd/speedtest-server/web/app.js`
+Run: `cd src && node --check cmd/speedlite-server/web/app.js`
 
-Run: `cd src && node --test cmd/speedtest-server/web/app.test.mjs`
+Run: `cd src && node --test cmd/speedlite-server/web/app.test.mjs`
 
-Run: `cd src && go build -o /tmp/speedtest-server-verify ./cmd/speedtest-server && go build -o /tmp/speedctl-verify ./cmd/speedctl`
+Run: `cd src && go build -o /tmp/speedlite-server-verify ./cmd/speedlite-server && go build -o /tmp/speedlite-cli-verify ./cmd/speedlite-cli`
 
 Expected: every command exits 0.
 
@@ -302,4 +302,4 @@ Expected: no whitespace errors, no temporary instrumentation, and only intended 
 
 - [ ] **Step 9: Commit Task 4**
 
-Run: `git add src/cmd/speedtest-server/web/index.html src/cmd/speedtest-server/web/app.js src/cmd/speedtest-server/web/style.css src/cmd/speedtest-server/web/app.test.mjs README.md docs/用户手册.md && git commit -m "docs: explain weak-network delivery accounting"`
+Run: `git add src/cmd/speedlite-server/web/index.html src/cmd/speedlite-server/web/app.js src/cmd/speedlite-server/web/style.css src/cmd/speedlite-server/web/app.test.mjs README.md docs/用户手册.md && git commit -m "docs: explain weak-network delivery accounting"`

@@ -23,7 +23,7 @@ import (
 	"sync"
 	"time"
 
-	"speedTest/internal/engine"
+	"speedlite/internal/engine"
 )
 
 // magic 4 字节。

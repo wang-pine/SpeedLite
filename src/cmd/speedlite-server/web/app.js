@@ -1,4 +1,4 @@
-/* speedTest 前端逻辑
+/* SpeedLite 前端逻辑
  *
  * 架构：前端本地采样统计（下行数收到字节、上行数发送字节，每 100ms 采样）。
  * 服务器只负责搬运数据：
@@ -8,7 +8,7 @@
  *
  * 说明：
  *  - UDP(WebRTC unreliable) 展示应用层交付损失：排队残留单独报告，不冒充
- *    IP 层 UDP 丢包；网页抖动不可用，精确值请用 CLI speedctl。
+ *    IP 层 UDP 丢包；网页抖动不可用，精确值请用 CLI speedlite-cli。
  *  - TCP 使用同一 WebSocket 上的有序 start/stop/result 建立共同统计边界。
  *  - 双向(both)方向：下行与上行同时进行，本地分别计数。
  */
@@ -29,16 +29,65 @@ const state = {
 };
 
 /* ---------- 配置 ---------- */
+// 包长档位：固定包长（单值） / 动态包长（媒体混合，按轮换序列切换大小包）。
+// 数值取常用 MTU/RTP 值：小包 512B、RTP 1200B、类720p 1400B、类1080p 1500B。
+const PACKET_PROFILES = {
+  fixed: { mode: 'fixed' },
+  'dyn-media': { mode: 'dynamic', sizes: [512, 1200, 1400, 1500] }, // 媒体混合：大小包轮换
+};
+// 用户自定义包长（写入 select 的 custom-fixed / custom-dyn 选项）。
+// custom-fixed: { fixed: N }。custom-dyn: { sizes: [..] }。
+let CUSTOM_PACKET = { 'custom-fixed': null, 'custom-dyn': null };
+
+/* 取当前选中包长 option 的元信息（k/label/value），data-k/data-label 定义在 option 上。 */
+function packetSelMeta() {
+  const sel = $('cfgPacketLen');
+  const opt = sel.options[sel.selectedIndex] || sel;
+  const value = String(opt.value);
+  return { value, kind: opt.dataset.k || 'fixed', label: opt.dataset.label || '' };
+}
+
 function getConfig() {
   let server = $('cfgServer').value.trim();
   if (!server) server = location.host;
   server = server.replace(/^https?:\/\//, '').replace(/\/.*$/, '');
+  const psm = packetSelMeta();
+  const rawKind = psm.kind;                    // fixed | dynamic | custom-fixed | custom-dyn
+  let packetKind = rawKind, packetSizes = null;
+  let packetLen = clampInt(psm.value, 64, 0x7fffffff, 131072);
+  let packetLabel = psm.label || '';
+
+  if (rawKind === 'custom-fixed') {
+    const c = CUSTOM_PACKET['custom-fixed'];
+    if (c) { packetLen = c; packetLabel = `自定义·固定 ${c}B`; packetKind = 'fixed'; }
+  } else if (rawKind === 'custom-dyn') {
+    const c = CUSTOM_PACKET['custom-dyn'];
+    if (c && c.length) {
+      packetSizes = c.slice();
+      packetLen = c[0];
+      packetKind = 'dynamic';               // 归一为 dynamic，走动态轮换
+      packetLabel = `自定义·动态 ${c.join('/')}B`;
+    }
+  } else if (rawKind === 'dynamic') {
+    packetSizes = (PACKET_PROFILES['dyn-media'].sizes).slice();
+    packetLen = packetSizes[0];
+    packetKind = 'dynamic';
+    packetLabel = `动态·媒体混合 ${packetSizes.join('/')}B`;
+  } else {
+    // fixed
+    packetKind = 'fixed';
+    packetLabel = `固定·${psm.label || ''} ${packetLen}B`;
+  }
+
   return {
     mode: $('cfgMode').value,          // tcp | udp | both
     dir: $('cfgDir').value,            // down | up | both
     streams: clampInt($('cfgStreams').value, 1, 16, 4),
     duration: clampFloat($('cfgDuration').value, 1, 120, 10),
-    packetLen: clampInt($('cfgPacketLen').value, 1024, 1048576, 131072),
+    packetLen,
+    packetKind,             // fixed | dynamic (custom 已归一到这两类)
+    packetSizes,
+    packetLabel,            // 人类可读的包长描述，用于结果/历史/曲线
     server,
     wsBase: (location.protocol === 'https:' ? 'wss://' : 'ws://') + server,
   };
@@ -52,6 +101,32 @@ function clampFloat(v, lo, hi, def) {
   const n = parseFloat(v);
   if (isNaN(n)) return def;
   return Math.max(lo, Math.min(hi, n));
+}
+
+/* 包长迭代器：固定模式复用同一 zero buffer；动态模式按 packetSizes 轮换。 */
+function makePacketIterator(cfg) {
+  if (cfg.packetKind !== 'dynamic' || !cfg.packetSizes || !cfg.packetSizes.length) {
+    const buf = new Uint8Array(cfg.packetLen);
+    return () => ({ buf, len: cfg.packetLen });
+  }
+  const sizes = cfg.packetSizes;
+  // 预分配各档 buffer，避免每包重复分配
+  const bufs = sizes.map((sz) => new Uint8Array(sz));
+  let i = 0;
+  return () => {
+    const buf = bufs[i];
+    const len = sizes[i];
+    i = (i + 1) % sizes.length;
+    return { buf, len };
+  };
+}
+
+/* 把 packet_kind / packet_sizes 写入 URL query（动态包长需要服务端轮换发包）。 */
+function addPacketParams(q, cfg) {
+  if (cfg.packetKind === 'dynamic' && cfg.packetSizes && cfg.packetSizes.length) {
+    q.set('packet_kind', 'dynamic');
+    q.set('packet_sizes', cfg.packetSizes.join(','));
+  }
 }
 
 /* ---------- 本地采样器：每个流一个 ---------- */
@@ -86,7 +161,9 @@ function makeMeter() {
       const uAvg = this.win.reduce((s, w) => s + w.u, 0) / n;
       if (dAvg > this.peakDown) this.peakDown = dAvg;
       if (uAvg > this.peakUp) this.peakUp = uAvg;
-      return { downMbps, upMbps };
+      // 返回滑动窗口均值（1s），而非单窗口瞬时值，让实时曲线平滑呈「爬升→稳定」，
+      // 避免因单帧突发/背压造成的单点锯齿。
+      return { downMbps: dAvg, upMbps: uAvg };
     },
     elapsed() { return (performance.now() - this.createdAt) / 1000; },
   };
@@ -233,7 +310,8 @@ function renderLegend(series) {
   let html = '<span class="dot down"></span>下行(实线) <span class="dot up"></span>上行(虚线)';
   for (const s of series) {
     const ts = new Date(s.ts).toLocaleTimeString();
-    html += ` <span class="series-tag" style="--sc:${s.color}">■ ${s.mode.toUpperCase()} ${dirText(s.dir)} ${ts}</span>`;
+    html += ` <span class="series-tag" style="--sc:${s.color}">■ ${s.mode.toUpperCase()} ${dirText(s.dir)}` +
+      (s.packetLabel ? ` · ${s.packetLabel}` : '') + ` ${ts}</span>`;
   }
   wrap.innerHTML = html;
 }
@@ -320,6 +398,7 @@ function runTCPStream(cfg, streamId, doneCb) {
     mode: 'tcp', dir: cfg.dir, streams: cfg.streams,
     duration: cfg.duration, packet_len: cfg.packetLen,
   });
+  addPacketParams(q, cfg);
   const url = `${cfg.wsBase}/ws/test?${q}`;
   const ws = new WebSocket(url);
   ws.binaryType = 'arraybuffer';
@@ -335,6 +414,8 @@ function runTCPStream(cfg, streamId, doneCb) {
 
   const zeroBuf = new Uint8Array(cfg.packetLen);
   let sentTotal = 0;   // 累计送入 send() 的字节
+  // 包长生成器：固定模式复用同一 buffer；动态模式按 packetSizes 轮换（模拟媒体混合包长）。
+  const pktNext = makePacketIterator(cfg);
 
   const finish = (err, res) => {
     if (finished) return;
@@ -357,23 +438,41 @@ function runTCPStream(cfg, streamId, doneCb) {
     startedAt = performance.now();
     meter.createdAt = startedAt;
     meter.lastT = startedAt;
-    if (cfg.dir === 'up' || cfg.dir === 'both') {
-      sendTimer = setInterval(() => {
-        if (ws.readyState !== WebSocket.OPEN) { clearInterval(sendTimer); return; }
-        while (ws.readyState === WebSocket.OPEN && ws.bufferedAmount < 16 * 1024 * 1024) {
-          ws.send(zeroBuf);
-          sentTotal += cfg.packetLen;
-        }
-      }, 0);
-      meter.sync = () => meter.syncTX(sentTotal - (ws.readyState === WebSocket.OPEN ? ws.bufferedAmount : 0));
-    }
-    stopTimer = setTimeout(() => {
+    const deadline = startedAt + cfg.duration * 1000;
+    let stopSent = false;
+    const sendStop = () => {
+      if (stopSent || finished) return;
+      stopSent = true;
       if (sendTimer) { clearInterval(sendTimer); sendTimer = null; }
-      if ((cfg.dir === 'up' || cfg.dir === 'both') && ws.readyState === WebSocket.OPEN) {
+      if (stopTimer) { clearTimeout(stopTimer); stopTimer = null; }
+      if (ws.readyState === WebSocket.OPEN) {
         // stop 与此前二进制帧共用有序 WebSocket；服务端读到它即确认全部上行负载。
         ws.send(JSON.stringify({ type: 'stop' }));
       }
-    }, cfg.duration * 1000);
+    };
+    if (cfg.dir === 'up' || cfg.dir === 'both') {
+      // 到点判定放在打流回调内同步执行：打流 while 可能长时间占住事件循环，
+      // 若依赖外层 setTimeout 触发 stop，stop 会被饿死（服务端等满 watchdog 后断开，
+      // 前端随即报"TCP 测速超时：服务端未返回最终统计"）。
+      sendTimer = setInterval(() => {
+        if (ws.readyState !== WebSocket.OPEN) { clearInterval(sendTimer); sendTimer = null; return; }
+        if (performance.now() >= deadline) {
+          sendStop();
+          return;
+        }
+        while (ws.readyState === WebSocket.OPEN &&
+               ws.bufferedAmount < 2 * 1024 * 1024 &&
+               performance.now() < deadline) {
+          const pkt = pktNext();
+          ws.send(pkt.buf);
+          sentTotal += pkt.len;
+        }
+        if (performance.now() >= deadline) sendStop();
+      }, 0);
+      meter.sync = () => meter.syncTX(sentTotal - (ws.readyState === WebSocket.OPEN ? ws.bufferedAmount : 0));
+      // 兜底：仅当主路径（回调内同步判定）失效时才依赖事件循环；晚 100ms 避免与主路径重复。
+      stopTimer = setTimeout(sendStop, cfg.duration * 1000 + 100);
+    }
   };
 
   ws.onmessage = (ev) => {
@@ -455,13 +554,24 @@ function runUDPStream(cfg, streamId, doneCb) {
   let localQueued = 0;
   let lastError = null;
 
-  const config = { ordered: false, maxRetransmits: 0 };
+  // UDP 测速：WebRTC DataChannel。用 reliable unordered（ordered:false，不设重传限制）。
+  // 原因：部分可靠(不重传)在 Chrome↔pion 间会因 SCTP 缺口死锁（上行数据发不出、测速卡住）。
+  // 可靠无序通道稳定不死锁，能测出爬升→稳定吞吐；真实 UDP 丢包/掣动请用命令行 speedlite-cli udp。
+  const config = { ordered: false };
   const dc = pc.createDataChannel('speedtest-' + streamId, config);
   dc.binaryType = 'arraybuffer';
 
-  const signal = new WebSocket(`${cfg.wsBase}/ws/signal?dir=${cfg.dir}&duration=${cfg.duration}&packet_len=${cfg.packetLen}&stream_id=${streamId}`);
+  // 构造信令 URL，动态包长时附带 packet_kind/packet_sizes 供服务端下行轮换
+  const signalQP = `dir=${encodeURIComponent(cfg.dir)}&duration=${cfg.duration}&packet_len=${cfg.packetLen}&stream_id=${encodeURIComponent(streamId)}` +
+    (cfg.packetKind === 'dynamic' && cfg.packetSizes && cfg.packetSizes.length
+      ? `&packet_kind=dynamic&packet_sizes=${cfg.packetSizes.join(',')}`
+      : '');
+  const signal = new WebSocket(`${cfg.wsBase}/ws/signal?${signalQP}`);
   const zeroBuf = new Uint8Array(cfg.packetLen);
   let sentTotal = 0;   // 累计送入 dc.send() 的字节
+  let uploadingStopped = false;   // stopUpload 幂等守卫（主路径与兜底可能并发/重复）
+  // 包长生成器：固定模式复用同一 buffer；动态模式按 packetSizes 轮换。
+  const pktNext = makePacketIterator(cfg);
 
   const finish = (err, res) => {
     if (finished) return;
@@ -482,8 +592,12 @@ function runUDPStream(cfg, streamId, doneCb) {
   }, (cfg.duration + 10) * 1000);
 
   const stopUpload = async () => {
+    if (uploadingStopped) return;
+    uploadingStopped = true;
     if (sendTimer) { clearInterval(sendTimer); sendTimer = null; }
-    localQueued = await waitForBufferedDrain(dc, 3000, 10);
+    if (stopTimer) { clearTimeout(stopTimer); stopTimer = null; }
+    // 排空等待设为 1.5s（可靠通道数据保证送达；超时则按已统计字节 + 标记截断，避免拖长时长）
+    localQueued = await waitForBufferedDrain(dc, 1500, 10);
     if (finished) return;
     meter.syncTX(drainedBytes(sentTotal, localQueued));
     if (signal.readyState === WebSocket.OPEN) {
@@ -533,16 +647,27 @@ function runUDPStream(cfg, streamId, doneCb) {
     meter.createdAt = startedAt;
     meter.lastT = startedAt;
     if (cfg.dir === 'up' || cfg.dir === 'both') {
+      // 与 TCP 相同：到点判定在打流回调内同步执行，避免 while 打流饿死 setTimeout(stop)。
+      const deadline = startedAt + cfg.duration * 1000;
       sendTimer = setInterval(() => {
-        if (dc.readyState !== 'open') { clearInterval(sendTimer); return; }
-        while (dc.readyState === 'open' && dc.bufferedAmount < 8 * 1024 * 1024) {
-          dc.send(zeroBuf);
-          sentTotal += cfg.packetLen;
+        if (dc.readyState !== 'open') { clearInterval(sendTimer); sendTimer = null; return; }
+        if (performance.now() >= deadline) {
+          stopUpload();
+          return;
         }
+        while (dc.readyState === 'open' &&
+               dc.bufferedAmount < 2 * 1024 * 1024 &&
+               performance.now() < deadline) {
+          const pkt = pktNext();
+          dc.send(pkt.buf);
+          sentTotal += pkt.len;
+        }
+        if (performance.now() >= deadline) stopUpload();
       }, 0);
       // 采样校正：真实已发 = 累计send − 缓冲滞留
       meter.sync = () => meter.syncTX(sentTotal - (dc.readyState === 'open' ? dc.bufferedAmount : 0));
-      stopTimer = setTimeout(stopUpload, cfg.duration * 1000);
+      // 兜底：仅当主路径失效时才依赖事件循环；晚 100ms 避免与主路径重复
+      stopTimer = setTimeout(stopUpload, cfg.duration * 1000 + 100);
     }
   };
   dc.onmessage = (ev) => {
@@ -570,7 +695,7 @@ function runUDP(cfg) {
 }
 
 /* ---------- 结果汇聚 ---------- */
-function aggregate(results, dir, phaseDuration, phasePeak) {
+function aggregate(results, dir, phaseDuration, phasePeak, meta) {
   let totalBytes = 0, duration = 0, peakSum = 0;
   let upBytes = 0, downBytes = 0;
   let submittedBytes = 0, queuedBytes = 0, truncated = false;
@@ -652,6 +777,11 @@ function aggregate(results, dir, phaseDuration, phasePeak) {
     srvUpBytes: srvCount ? srvUpBytes : null,
     srvDownBytes: srvCount ? srvDownBytes : null,
     lossPct, upLossPct, downLossPct, devPct,
+    // 包长元信息（用于按包长分类记录/展示）
+    packetLen: meta ? meta.packetLen : null,
+    packetLabel: meta ? meta.packetLabel : '',
+    packetKind: meta ? meta.packetKind : 'fixed',
+    packetSizes: meta ? meta.packetSizes : null,
   };
 }
 
@@ -659,26 +789,25 @@ function addResultRow(mode, dir, r) {
   const tbody = document.querySelector('#resultTable tbody');
   const tr = document.createElement('tr');
   tr.className = mode === 'tcp' ? 'row-tcp' : 'row-udp';
-  tr.dataset.key = `${mode}|${dir}`;
+  const pktKey = (r.packetKind || 'fixed') + '|' + (r.packetLen || '');
+  tr.dataset.key = `${mode}|${dir}|${pktKey}`;
   const dTxt = dirText(dir) + (dir === 'up' ? ' ▲' : dir === 'down' ? ' ▼' : ' ⇅');
+  // 链路列简短展示包长（完整描述放明细行），避免重复拼接
+  const packetCell = r.packetLen ? `${r.packetLen}B` : '—';
   // 双向时分别展示上下行速率
   let avgCell = `${(r.avgMbitps).toFixed(1)} Mbit/s`;
   if (dir === 'both') {
     avgCell = `▼ ${(r.downMbps).toFixed(1)} / ▲ ${(r.upMbps).toFixed(1)} Mbit/s`;
   }
   const timeCell = new Date().toLocaleTimeString();
-  // 网页 UDP 展示应用层交付损失；它不是 IP 层 UDP 包丢失率。
-  let lostCell = mode === 'udp' && r.lossPct !== null && r.lossPct !== undefined
-    ? r.lossPct.toFixed(1) + '%' : '0%';
+  // 网页 UDP 用可靠通道测吞吐，交付损失=0；真实 IP 层丢包用 CLI。
+  let lostCell = '0%';
   let lostCls = '';
-  if (mode === 'udp' && r.lossPct !== null && r.lossPct !== undefined) {
-    lostCls = r.lossPct > 30 ? 'num-bad' : r.lossPct > 5 ? 'num-warn' : 'num-ok';
-  }
   const jitterCell = '—';
   const lossLabel = mode === 'udp' ? '交付损失' : '丢包率';
   // 主行：每个 td 带 data-label，手机竖屏下 CSS 卡片化时展示列名
   tr.innerHTML = `
-    <td data-label="链路">${mode.toUpperCase()}</td>
+    <td data-label="链路">${mode.toUpperCase()} <span class="pkt">${packetCell}</span></td>
     <td data-label="方向">${dTxt}</td>
     <td data-label="平均">${avgCell}</td>
     <td data-label="峰值">${(r.peakMbitps).toFixed(1)} Mbit/s</td>
@@ -688,16 +817,17 @@ function addResultRow(mode, dir, r) {
     <td data-label="用时">${r.duration.toFixed(1)} s</td>
     <td data-label="时间" class="time">${timeCell}</td>`;
   tbody.appendChild(tr);
-  // 附加信息行：流数 + 字节明细 + 服务端对账（偏差分级警示）
+  // 附加信息行：流数 + 包长 + 字节明细 + 服务端对账（偏差分级警示）
   const detail = document.createElement('tr');
   detail.className = 'row-detail';
-  detail.dataset.key = `${mode}|${dir}`;
+  detail.dataset.key = `${mode}|${dir}|${pktKey}`;
   const directionBytes = dir === 'up'
     ? `上行 ${fmtBytes(r.upBytes)}`
     : dir === 'down'
       ? `下行 ${fmtBytes(r.downBytes)}`
       : `下行 ${fmtBytes(r.downBytes)} · 上行 ${fmtBytes(r.upBytes)}`;
   let detailTxt = `${r.streams} 条并行流 · ${directionBytes}`;
+  if (r.packetLabel) detailTxt += ` · 包长 ${r.packetLabel}`;
   if (r.incomplete) detailTxt += ` · ${r.failedStreams} 条流失败（结果不完整）`;
   if (r.srvBytes !== null && r.srvBytes !== undefined) {
     const dev = mode === 'udp' && r.lossPct !== null && r.lossPct !== undefined
@@ -751,12 +881,12 @@ function addResultRow(mode, dir, r) {
   tbody.appendChild(detail);
 }
 
-// 重新测试同链路时替换旧结果行（主行+明细行）
-function removeResultRow(mode, dir) {
-  const key = `${mode}|${dir}`;
+// 重新测试同链路+同包长时替换旧结果行（主行+明细行）
+function removeResultRow(mode, dir, packetKey) {
+  const pktKey = packetKey || '*';
   const tbody = document.querySelector('#resultTable tbody');
   for (const tr of [...tbody.querySelectorAll('tr')]) {
-    if (tr.dataset.key === key) tr.remove();
+    if (tr.dataset.key === `${mode}|${dir}|${pktKey}`) tr.remove();
   }
 }
 
@@ -789,6 +919,7 @@ function renderHistory() {
   for (const h of hist) {
     const li = document.createElement('li');
     li.textContent = `${new Date(h.ts).toLocaleTimeString()} · ${h.mode.toUpperCase()} ${h.dir} · ` +
+      (h.packetLabel ? `包长 ${h.packetLabel} · ` : '') +
       `平均 ${h.avgMbitps.toFixed(1)} Mbit/s`;
     ul.appendChild(li);
   }
@@ -797,15 +928,15 @@ function renderHistory() {
 /* ---------- 主流程 ---------- */
 const SERIES_COLORS = ['#38bdf8', '#fbbf24', '#a78bfa', '#34d399', '#fb7185', '#f97316', '#22d3ee', '#a3e635'];
 
-function ensureSeries(mode, dir) {
-  // 同一 (链路+方向) 重新测试 → 替换旧系列；不同项 → 缓存追加
-  const key = `${mode}|${dir}`;
+function ensureSeries(mode, dir, packetKey, packetLabel) {
+  // 同一 (链路+方向+包长) 重新测试 → 替换旧系列；不同项 → 缓存追加
+  const key = `${mode}|${dir}|${packetKey || ''}`;
   const now = Date.now();
   for (let i = state.series.length - 1; i >= 0; i--) {
     if (state.series[i].key === key) state.series.splice(i, 1);
   }
   const color = SERIES_COLORS[state.series.length % SERIES_COLORS.length];
-  const series = { key, id: now, mode, dir, ts: now, color, points: [] };
+  const series = { key, id: now, mode, dir, packetKey, packetLabel, ts: now, color, points: [] };
   state.series.push(series);
   return series;
 }
@@ -824,11 +955,13 @@ async function start() {
   $('valUp').textContent = '0.0';
 
   const modes = cfg.mode === 'both' ? ['tcp', 'udp'] : [cfg.mode];
+  const packetKey = `${cfg.packetKind}|${cfg.packetLen}`;
+  const packetLabel = cfg.packetLabel;
   try {
     for (const mode of modes) {
-      // each 实际链路单独一条缓存曲线
-      removeResultRow(mode, cfg.dir);
-      state.curSeries = ensureSeries(mode, cfg.dir);
+      // each 实际链路单独一条缓存曲线；同链路+同包长才替换旧行/旧曲线
+      removeResultRow(mode, cfg.dir, packetKey);
+      state.curSeries = ensureSeries(mode, cfg.dir, packetKey, packetLabel);
       renderLegend(state.series);
       state.phaseText = `正在测试 ${mode.toUpperCase()} · ${cfg.dir === 'up' ? '上行' : cfg.dir === 'down' ? '下行' : '双向'}`;
       const phaseStartedAt = performance.now();
@@ -838,11 +971,14 @@ async function start() {
       }
       const phaseDuration = Math.max((performance.now() - phaseStartedAt) / 1000, 0.001);
       const phasePeak = peakFromPoints(state.curSeries ? state.curSeries.points : [], cfg.dir);
-      const agg = aggregate(results, cfg.dir, phaseDuration, phasePeak);
+      const agg = aggregate(results, cfg.dir, phaseDuration, phasePeak, {
+        packetLen: cfg.packetLen, packetLabel: cfg.packetLabel,
+        packetKind: cfg.packetKind, packetSizes: cfg.packetSizes,
+      });
       if (!agg) throw new Error(`所有 ${mode.toUpperCase()} 流均失败`);
       addResultRow(mode, cfg.dir, agg);
       if (!agg.incomplete) {
-        saveHistory({ ts: Date.now(), mode, dir: cfg.dir, avgMbitps: agg.avgMbitps });
+        saveHistory({ ts: Date.now(), mode, dir: cfg.dir, avgMbitps: agg.avgMbitps, packetLabel: agg.packetLabel, packetLen: agg.packetLen, packetKind: agg.packetKind });
       }
     }
     state.curSeries = null;
@@ -920,11 +1056,54 @@ document.addEventListener('DOMContentLoaded', () => {
     localStorage.removeItem('speedtest-history');
     renderHistory();
   });
+  $('btnCustomPacket').addEventListener('click', askCustomPacket);
+  $('cfgPacketLen').addEventListener('change', () => {
+    // 自定义档位未设置时，切过去提示用户先填
+    const k = packetSelMeta().kind;
+    if ((k === 'custom-fixed' && !CUSTOM_PACKET['custom-fixed']) ||
+        (k === 'custom-dyn' && !CUSTOM_PACKET['custom-dyn'])) {
+      askCustomPacket();
+    }
+  });
   renderHistory();
   fitChartToViewport();
   drawChart();
   window.addEventListener('resize', () => { fitChartToViewport(); });
 });
+
+/* 自定义包长：固定 → 单个字节数；动态 → 逗号分隔的包长序列。 */
+function askCustomPacket() {
+  const sel = $('cfgPacketLen');
+  const psm = packetSelMeta();
+  const kind = psm.kind;   // custom-fixed | custom-dyn
+  const opt = sel.options[sel.selectedIndex] || sel;
+  const isDyn = kind === 'custom-dyn';
+  const hint = isDyn
+    ? '动态包长：逗号分隔的多个字节数（如 512,1200,1400,1500）'
+    : '固定包长：单个字节数（如 1400）';
+  const current = isDyn
+    ? (CUSTOM_PACKET['custom-dyn'] || []).join(',')
+    : (CUSTOM_PACKET['custom-fixed'] || '1400');
+  const input = window.prompt(`${hint}\n当前: ${current}`, current);
+  if (input === null) return;   // 取消
+  const cleaned = input.trim();
+  if (!cleaned) { alert('请输入有效包长'); return; }
+  if (isDyn) {
+    const sizes = cleaned.split(/[,，;；\s]+/).map(Number).filter((n) => n > 0 && n <= 8 * 1024 * 1024);
+    if (!sizes.length) { alert('动态包长请输入大于 0 的字节数，逗号分隔'); return; }
+    CUSTOM_PACKET['custom-dyn'] = sizes;
+    opt.setAttribute('data-label', `自定义·动态 ${sizes.join('/')}B`);
+    opt.textContent = `自定义 · 动态 (${sizes.join('/')}B)`;
+  } else {
+    const n = Number(cleaned);
+    if (!(n > 0 && n <= 8 * 1024 * 1024)) { alert('固定包长请输入 1 个有效的字节数'); return; }
+    CUSTOM_PACKET['custom-fixed'] = n;
+    sel.value = 'custom-fixed';
+    const opt2 = sel.options[sel.selectedIndex] || sel;
+    opt2.setAttribute('data-label', `自定义·固定 ${n}B`);
+    opt2.textContent = `自定义 · 固定 (${n}B)`;
+  }
+}
 
 // 调试/测试钩子（对前端无副作用）
 if (typeof window !== 'undefined' && window !== undefined) {

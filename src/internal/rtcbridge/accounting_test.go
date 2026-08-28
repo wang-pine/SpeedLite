@@ -5,6 +5,8 @@ import (
 	"net/url"
 	"testing"
 	"time"
+
+	"speedlite/internal/engine"
 )
 
 func TestParseSignalParamsRejectsUnsafeValues(t *testing.T) {
@@ -41,7 +43,7 @@ func (failingDataChannel) BufferedAmount() uint64 { return 0 }
 
 func TestSendDownPropagatesSendError(t *testing.T) {
 	st := newRTCStats()
-	err := sendDown(failingDataChannel{}, 1, 1024, st, make(chan struct{}))
+	err := sendDown(failingDataChannel{}, 1, &engine.Params{PacketLen: 1024}, st, make(chan struct{}))
 	if err == nil || err.Error() != "send failed" {
 		t.Fatalf("sendDown error = %v, want send failed", err)
 	}

@@ -1,11 +1,11 @@
-// Command speedtest-server 是测速服务端：托管 Web 前端 + WebSocket(TCP) 测速 +
+// Command speedlite-server 是测速服务端：托管 Web 前端 + WebSocket(TCP) 测速 +
 // 原生 TCP/UDP 测速端口（供 CLI 使用）。
 //
 // 端口约定（均可通过 flags 修改）：
 //
 //	-http  8080  Web 页面 + WebSocket 测速（+ WebRTC 信令）
-//	-tcp   5001  原生 TCP 测速（speedctl 使用）
-//	-udp   5201  原生 UDP 测速（speedctl 使用）
+//	-tcp   5001  原生 TCP 测速（speedlite-cli 使用）
+//	-udp   5201  原生 UDP 测速（speedlite-cli 使用）
 package main
 
 import (
@@ -16,11 +16,11 @@ import (
 	"log"
 	"net/http"
 
-	"speedTest/internal/rtcbridge"
-	"speedTest/internal/tcpnative"
-	"speedTest/internal/udpnative"
-	"speedTest/internal/version"
-	"speedTest/internal/wsstream"
+	"speedlite/internal/rtcbridge"
+	"speedlite/internal/tcpnative"
+	"speedlite/internal/udpnative"
+	"speedlite/internal/version"
+	"speedlite/internal/wsstream"
 )
 
 //go:embed web
@@ -37,7 +37,7 @@ func main() {
 	flag.Parse()
 
 	if *showVer {
-		fmt.Printf("speedtest-server %s\n", version.Version)
+		fmt.Printf("speedlite-server %s\n", version.Version)
 		return
 	}
 
@@ -68,10 +68,10 @@ func main() {
 	defer udpServer.Close()
 	log.Printf("[udp-native] listening on %s", *udpAddr)
 
-	log.Printf("speedtest-server v%s 启动", version.Version)
+	log.Printf("speedlite-server v%s 启动", version.Version)
 	log.Printf("  Web/WS:   http://localhost%s  (页面 + /ws/test)", *httpAddr)
-	log.Printf("  原生TCP:  %s  (speedctl)", *tcpAddr)
-	log.Printf("  原生UDP:  %s  (speedctl)", *udpAddr)
+	log.Printf("  原生TCP:  %s  (speedlite-cli)", *tcpAddr)
+	log.Printf("  原生UDP:  %s  (speedlite-cli)", *udpAddr)
 	if err := http.ListenAndServe(*httpAddr, nil); err != nil {
 		log.Fatal(err)
 	}

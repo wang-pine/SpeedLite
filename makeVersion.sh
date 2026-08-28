@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-# makeVersion.sh — speedTest 版本化多平台构建打包脚本
+# makeVersion.sh — SpeedLite 版本化多平台构建打包脚本
 #
 # 用法：
 #   ./makeVersion.sh              按 config/version.ini 构建全部平台
@@ -13,11 +13,11 @@
 #   [platforms]  平台名=GOOS/GOARCH 后缀 → 目标平台矩阵
 #
 # 产物输出：
-#   dest/<平台名>/speedtest-server[-<版本>][.exe]
-#   dest/<平台名>/speedctl[-<版本>][.exe]
+#   dest/<平台名>/speedlite-server[-<版本>][.exe]
+#   dest/<平台名>/speedlite-cli[-<版本>][.exe]
 #   dest/<平台名>/SHA256SUMS            校验和
-#   dest/<平台名>/speedtest-<版本>-<平台名>.tar.gz   发行包（linux/darwin）
-#   dest/<平台名>/speedtest-<版本>-<平台名>.zip      发行包（windows）
+#   dest/<平台名>/speedlite-<版本>-<平台名>.tar.gz   发行包（linux/darwin）
+#   dest/<平台名>/speedlite-<版本>-<平台名>.zip      发行包（windows）
 # ============================================================
 set -euo pipefail
 
@@ -65,7 +65,7 @@ fi
 VERSION="$MAJOR.$MINOR.$PATCH"
 [ $# -ge 1 ] && [ "$1" != "-h" ] && VERSION="$1"   # 命令行覆盖
 
-APP_NAME=$(ini_get app name); APP_NAME="${APP_NAME:-speedtest}"
+APP_NAME=$(ini_get app name); APP_NAME="${APP_NAME:-speedlite}"
 
 # ---------- 构建函数 ----------
 # Go 缓存可写性探测：GOCACHE/GOMODCACHE 默认在 $HOME 下，沙箱/受限环境可能只读，
@@ -110,14 +110,14 @@ build_one() {
   [ -n "${GOPATH:-}" ] && envs+=("GOPATH=$GOPATH")
 
   local srv="$APP_NAME-server${suffix}"
-  local cli="speedctl${suffix}"
+  local cli="speedlite-cli${suffix}"
   local srv_out="$outdir/$srv"
   local cli_out="$outdir/$cli"
 
-  ( cd "$SRC_DIR" && env "${envs[@]}" go build -trimpath -ldflags="-s -w -X speedTest/internal/version.Version=$VERSION" \
-      -o "$srv_out" ./cmd/speedtest-server )
-  ( cd "$SRC_DIR" && env "${envs[@]}" go build -trimpath -ldflags="-s -w -X speedTest/internal/version.Version=$VERSION" \
-      -o "$cli_out" ./cmd/speedctl )
+  ( cd "$SRC_DIR" && env "${envs[@]}" go build -trimpath -ldflags="-s -w -X speedlite/internal/version.Version=$VERSION" \
+      -o "$srv_out" ./cmd/speedlite-server )
+  ( cd "$SRC_DIR" && env "${envs[@]}" go build -trimpath -ldflags="-s -w -X speedlite/internal/version.Version=$VERSION" \
+      -o "$cli_out" ./cmd/speedlite-cli )
 
   # 版本文件
   echo "$VERSION" > "$outdir/VERSION"
@@ -144,7 +144,7 @@ if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
 fi
 
 echo "=============================================="
-echo " speedTest 构建  v$VERSION"
+echo " SpeedLite 构建  v$VERSION"
 echo " 配置: $CONFIG_FILE"
 echo " 源码: $SRC_DIR"
 echo " 输出: $DEST_DIR"

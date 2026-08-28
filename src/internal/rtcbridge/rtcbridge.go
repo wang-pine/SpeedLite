@@ -18,13 +18,14 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/pion/webrtc/v4"
 
-	"speedTest/internal/engine"
+	"speedlite/internal/engine"
 )
 
 var upgrader = websocket.Upgrader{
@@ -88,6 +89,19 @@ func parseSignalParams(q url.Values) (*engine.Params, error) {
 		}
 		p.PacketLen = int(value)
 	}
+	// 动态包长：解析逗号分隔的轮换序列
+	p.PacketKind = q.Get("packet_kind")
+	if raw := q.Get("packet_sizes"); raw != "" {
+		for _, part := range strings.Split(raw, ",") {
+			v, parseErr := strconv.Atoi(strings.TrimSpace(part))
+			if parseErr == nil && v > 0 {
+				p.PacketSizes = append(p.PacketSizes, v)
+			}
+		}
+	}
+	if p.PacketKind == "dynamic" && len(p.PacketSizes) > 0 {
+		p.PacketLen = p.PacketSizes[0]
+	}
 	if err := p.Validate(); err != nil {
 		return nil, err
 	}
@@ -130,7 +144,6 @@ func HandleSignal(w http.ResponseWriter, r *http.Request) {
 	}
 	dir := string(p.Direction)
 	duration := p.Duration
-	packetLen := p.PacketLen
 
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
@@ -177,7 +190,7 @@ func HandleSignal(w http.ResponseWriter, r *http.Request) {
 
 	// 数据通道处理
 	pc.OnDataChannel(func(dc *webrtc.DataChannel) {
-		handleDataChannel(dc, dir, duration, packetLen, st, cancel, downDone)
+		handleDataChannel(dc, dir, duration, p, st, cancel, downDone)
 	})
 
 	// 交换 SDP
@@ -246,7 +259,7 @@ func HandleSignal(w http.ResponseWriter, r *http.Request) {
 	cancelAll()
 
 	// stop 触发后，给在途数据（上行残留包 / 下行缓冲排空）一点时间抵达
-	time.Sleep(800 * time.Millisecond)
+	time.Sleep(300 * time.Millisecond)
 
 	// 发送服务端最终统计（双重对账），再关闭连接
 	st.rx.Tick()
@@ -291,8 +304,9 @@ func HandleSignal(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleDataChannel 在一个 DataChannel 上执行打流。
-func handleDataChannel(dc *webrtc.DataChannel, dir string, duration float64, packetLen int, st *rtcStats, cancel <-chan struct{}, downDone chan<- error) {
+func handleDataChannel(dc *webrtc.DataChannel, dir string, duration float64, p *engine.Params, st *rtcStats, cancel <-chan struct{}, downDone chan<- error) {
 	dc.SetBufferedAmountLowThreshold(1 << 20)
+	dc.OnClose(func() {})
 
 	// 读：处理客户端上行（up/both）——服务器计数接收量
 	if dir == "up" || dir == "both" {
@@ -303,12 +317,11 @@ func handleDataChannel(dc *webrtc.DataChannel, dir string, duration float64, pac
 			}
 		})
 	}
-
 	dc.OnOpen(func() {
 		st.start()
 		if dir == "down" || dir == "both" {
 			go func() {
-				downDone <- sendDown(dc, duration, packetLen, st, cancel)
+				downDone <- sendDown(dc, duration, p, st, cancel)
 			}()
 		}
 	})
@@ -326,15 +339,16 @@ type dataChannelSender interface {
 // 因此用 bufferedAmount 阈值做发送端背压：缓冲水位高时暂停，
 // 让接收端消化速度成为真实测速瓶颈（与浏览器端 send 背压同理）。
 // 发送量为真实进入通道的字节（st.tx 计数），用于服务端对账。
-func sendDown(dc dataChannelSender, duration float64, packetLen int, st *rtcStats, cancel <-chan struct{}) error {
+// 包长：固定模式用 p.PacketLen；动态模式按 p.PacketSizes 轮换（媒体混合）。
+func sendDown(dc dataChannelSender, duration float64, p *engine.Params, st *rtcStats, cancel <-chan struct{}) error {
 	st.start()
-	buf := engine.NewZeroBuffer(packetLen)
+	pktIter := makeSignalPktIter(p)
 	deadline := time.NewTimer(time.Duration(duration * float64(time.Second)))
 	defer deadline.Stop()
 
 	const (
-		highWater = 4 * 1024 * 1024 // 4MiB 缓冲水位上限
-		lowWater  = 1 * 1024 * 1024 // 降至 1MiB 再继续
+		highWater = 1 * 1024 * 1024 // 1MiB 缓冲水位上限（降低堆积，减少交付损失）
+		lowWater  = 256 * 1024      // 降至 256KiB 再继续
 		sleepNs   = 200 * time.Microsecond
 	)
 
@@ -344,7 +358,7 @@ func sendDown(dc dataChannelSender, duration float64, packetLen int, st *rtcStat
 			finalizeDown(st, dc.BufferedAmount())
 			return fmt.Errorf("downlink cancelled")
 		case <-deadline.C:
-			remaining := waitForDrain(dc.BufferedAmount, 3*time.Second)
+			remaining := waitForDrain(dc.BufferedAmount, 2*time.Second)
 			finalizeDown(st, remaining)
 			return nil
 		default:
@@ -358,7 +372,7 @@ func sendDown(dc dataChannelSender, duration float64, packetLen int, st *rtcStat
 					finalizeDown(st, dc.BufferedAmount())
 					return fmt.Errorf("downlink cancelled")
 				case <-deadline.C:
-					remaining := waitForDrain(dc.BufferedAmount, 3*time.Second)
+					remaining := waitForDrain(dc.BufferedAmount, 2*time.Second)
 					finalizeDown(st, remaining)
 					return nil
 				default:
@@ -366,11 +380,34 @@ func sendDown(dc dataChannelSender, duration float64, packetLen int, st *rtcStat
 				}
 			}
 		}
+		buf := pktIter()
 		if err := dc.Send(buf); err != nil {
 			finalizeDown(st, dc.BufferedAmount())
 			return err
 		}
 		st.tx.Add(uint64(len(buf)))
+	}
+}
+
+// makeSignalPktIter 返回包长迭代器：固定模式每包用 p.PacketLen；动态模式按
+// p.PacketSizes 轮换（模拟媒体混合，大小不一的 RTP 包）。
+func makeSignalPktIter(p *engine.Params) func() []byte {
+	if p.PacketKind != "dynamic" || len(p.PacketSizes) == 0 {
+		buf := engine.NewZeroBuffer(p.PacketLen)
+		return func() []byte { return buf }
+	}
+	bufs := make([][]byte, len(p.PacketSizes))
+	for i, sz := range p.PacketSizes {
+		if sz <= 0 {
+			sz = p.PacketLen
+		}
+		bufs[i] = engine.NewZeroBuffer(sz)
+	}
+	i := 0
+	return func() []byte {
+		b := bufs[i]
+		i = (i + 1) % len(bufs)
+		return b
 	}
 }
 

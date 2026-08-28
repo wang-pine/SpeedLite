@@ -11,8 +11,8 @@
 
 # ============ Go ============
 # src 下 go build 直接生成的二进制
-/src/speedtest-server
-/src/speedctl
+/src/speedlite-server
+/src/speedlite-cli
 
 # ============ Node / 前端测试 ============
 node_modules/
@@ -28,4 +28,4 @@ Thumbs.db
 
 # ============ 日志 ============
 *.log
-speedtest.log
+speedlite.log

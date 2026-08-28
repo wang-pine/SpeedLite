@@ -7,12 +7,13 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
 
-	"speedTest/internal/engine"
+	"speedlite/internal/engine"
 )
 
 // upgrader 允许跨域（测速页面可能与服务器不同源）。
@@ -39,16 +40,37 @@ type ControlMessage struct {
 func parseParams(r *http.Request) (*engine.Params, error) {
 	q := r.URL.Query()
 	p := &engine.Params{
-		Mode:      engine.Mode(q.Get("mode")),
-		Direction: engine.Direction(q.Get("dir")),
-		Streams:   atoi(q.Get("streams")),
-		Duration:  atof(q.Get("duration")),
-		PacketLen: atoi(q.Get("packet_len")),
+		Mode:       engine.Mode(q.Get("mode")),
+		Direction:  engine.Direction(q.Get("dir")),
+		Streams:    atoi(q.Get("streams")),
+		Duration:   atof(q.Get("duration")),
+		PacketLen:  atoi(q.Get("packet_len")),
+		PacketKind: q.Get("packet_kind"),
+		PacketSizes: parseSizes(q.Get("packet_sizes")),
+	}
+	if p.PacketKind == "dynamic" && len(p.PacketSizes) > 0 {
+		p.PacketLen = p.PacketSizes[0]
 	}
 	if err := p.Validate(); err != nil {
 		return nil, err
 	}
 	return p, nil
+}
+
+// parseSizes 解析逗号分隔的包长序列，如 "512,1200,1400,1500"。
+func parseSizes(s string) []int {
+	if s == "" {
+		return nil
+	}
+	parts := strings.Split(s, ",")
+	out := make([]int, 0, len(parts))
+	for _, part := range parts {
+		v := atoi(strings.TrimSpace(part))
+		if v > 0 {
+			out = append(out, v)
+		}
+	}
+	return out
 }
 
 func atoi(s string) int {
@@ -148,7 +170,11 @@ func runStream(conn *websocket.Conn, p *engine.Params) {
 	}
 
 	// 上行的结束边界由同一 WebSocket 上、排在全部二进制帧后的 stop 消息确定。
+	// 为防前端 stop 因发送积压/网络阻塞而迟到：除读到 stop 外，还加一个「时长定时器」，
+	// 到点也主动关闭 upDone，保证上行最迟 duration 秒结束（不会拖到 watchdog 超时）。
 	if p.Direction == engine.DirUp || p.Direction == engine.DirBoth {
+		var upOnce sync.Once
+		finishUp := func() { upOnce.Do(func() { close(upDone) }) }
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -170,10 +196,26 @@ func runStream(conn *websocket.Conn, p *engine.Params) {
 						return
 					}
 					if control.Type == "stop" {
-						close(upDone)
+						finishUp()
 						return
 					}
 				}
+			}
+		}()
+		// 时长到点兜底：即使 stop 未及时到达，也在 duration 后结束上行边界。
+		// 留 +1s 余量给前端的 stop（若前端 stop 在 10s 到达，它会先关闭 upDone，
+		// 读 goroutine 读完所有数据帧后自然结束；此定时器仅在 stop 真的丢失时兜底，
+		// 避免与前端 stop 竞争导致 result 早于数据发回）。
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			timer := time.NewTimer(time.Duration((p.Duration + 1) * float64(time.Second)))
+			defer timer.Stop()
+			select {
+			case <-cancel:
+				return
+			case <-timer.C:
+				finishUp()
 			}
 		}()
 	} else {
@@ -209,14 +251,24 @@ func runStream(conn *websocket.Conn, p *engine.Params) {
 	}()
 
 	// 下行在独立 goroutine 中按服务端时长发送；downDone 是其有序结束边界。
+	// 关键：WriteMessage 是无超时的阻塞写，若客户端读慢/TCP 拥塞，它会无限阻塞，
+	// 即使 10s timer 到点 goroutine 也退不出，downDone 不关闭，测试拖到 watchdog 才超时。
+	// 因此给每次写设绝对写超时（开始 + duration + 2s），TCP 阻塞时超时返回错误，
+	// 强制 goroutine 退出并关闭 downDone，保证按时结束。
 	if p.Direction == engine.DirDown || p.Direction == engine.DirBoth {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			defer close(downDone)
-			buf := engine.NewZeroBuffer(p.PacketLen)
+			// 包长迭代器：固定模式（单包长）；动态模式按 PacketSizes 轮换（媒体混合）。
+			pktIter := makePktIter(p.PacketLen, p.PacketKind, p.PacketSizes)
 			timer := time.NewTimer(time.Duration(p.Duration * float64(time.Second)))
 			defer timer.Stop()
+			// 写超时设为「测试开始 + duration + 1s」的绝对上限：正常测试在 duration 内
+			// 快速写完所有帧，永不触发超时（连接完好，result 可正常回）；仅当 TCP 严重
+			// 拥塞导致某次写在 deadline 后仍未完成时，才超时返回错误强制结束，避免
+			// “10s 测试被拖到 20s”。超时后连接 corrupt，此时回不到 result 也属极端场景。
+			writeDeadline := time.Now().Add(time.Duration((p.Duration + 1) * float64(time.Second)))
 			for {
 				select {
 				case <-cancel:
@@ -225,6 +277,8 @@ func runStream(conn *websocket.Conn, p *engine.Params) {
 					return
 				default:
 				}
+				buf := pktIter()
+				_ = conn.SetWriteDeadline(writeDeadline)
 				connMu.Lock()
 				err := conn.WriteMessage(websocket.BinaryMessage, buf)
 				connMu.Unlock()
@@ -239,7 +293,7 @@ func runStream(conn *websocket.Conn, p *engine.Params) {
 		close(downDone)
 	}
 
-	watchdog := time.NewTimer(time.Duration((p.Duration + 10) * float64(time.Second)))
+	watchdog := time.NewTimer(time.Duration((p.Duration + 4) * float64(time.Second)))
 	defer watchdog.Stop()
 	waitFor := func(done <-chan struct{}) bool {
 		select {
@@ -296,4 +350,26 @@ func max(a, b float64) float64 {
 		return a
 	}
 	return b
+}
+
+// makePktIter 返回一个包长迭代器：固定模式每个包用 packetLen；动态模式按 sizes 轮换
+// （模拟媒体混合：大小不一的 RTP 包）。预分配各档 buffer，避免每包重复分配。
+func makePktIter(packetLen int, kind string, sizes []int) func() []byte {
+	if kind != "dynamic" || len(sizes) == 0 {
+		buf := engine.NewZeroBuffer(packetLen)
+		return func() []byte { return buf }
+	}
+	bufs := make([][]byte, len(sizes))
+	for i, sz := range sizes {
+		if sz <= 0 {
+			sz = packetLen
+		}
+		bufs[i] = engine.NewZeroBuffer(sz)
+	}
+	i := 0
+	return func() []byte {
+		b := bufs[i]
+		i = (i + 1) % len(bufs)
+		return b
+	}
 }

@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>speedTest · 带宽测速</title>
+<title>SpeedLite · 带宽测速</title>
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚡</text></svg>">
 <link rel="stylesheet" href="style.css">
 </head>
@@ -11,7 +11,7 @@
 <header class="topbar">
   <div class="brand">
     <span class="logo">⚡</span>
-    <h1>speedTest</h1>
+    <h1>SpeedLite</h1>
     <span class="sub">TCP / UDP 上下行带宽测速</span>
   </div>
   <div class="server-info" id="serverInfo">服务器: <b id="serverHost">-</b></div>
@@ -42,8 +42,17 @@
       <label>时长（秒）
         <input type="number" id="cfgDuration" value="10" min="1" max="120">
       </label>
-      <label>包大小（字节）
-        <input type="number" id="cfgPacketLen" value="131072" min="1024" max="1048576">
+      <label>包大小
+        <select id="cfgPacketLen">
+          <option value="512" data-k="fixed" data-label="高频小包">固定 · 高频小包 (512B)</option>
+          <option value="1200" data-k="fixed" data-label="RTP 包">固定 · RTP 包 (1200B)</option>
+          <option value="1400" data-k="fixed" data-label="类720p">固定 · 类720p (1400B)</option>
+          <option value="1500" data-k="fixed" data-label="类1080p">固定 · 类1080p (1500B)</option>
+          <option value="dyn-media" data-k="dynamic" data-label="媒体混合">动态 · 媒体混合 (512/1200/1400/1500B)</option>
+          <option value="custom-fixed" data-k="custom-fixed" data-label="自定义·固定">自定义 · 固定包长</option>
+          <option value="custom-dyn" data-k="custom-dyn" data-label="自定义·动态">自定义 · 动态包长</option>
+        </select>
+        <button type="button" id="btnCustomPacket" class="secondary small" title="填入自定义包长（固定=单个字节数；动态=逗号分隔的多个字节数）">⚙ 自定义</button>
       </label>
       <label>服务器地址
         <input type="text" id="cfgServer" placeholder="留空=当前页面服务器">
@@ -52,7 +61,7 @@
     <div class="actions">
       <button id="btnStart" class="primary">▶ 开始测速</button>
       <button id="btnStop" disabled>■ 停止</button>
-      <span class="hint">浏览器 WebSocket 测 TCP；UDP 走 WebRTC DataChannel（真实 UDP 封装）。极限精度用命令行 <code>speedctl</code>。</span>
+      <span class="hint">浏览器 WebSocket 测 TCP；UDP 走 WebRTC DataChannel（可靠无序，测吞吐；真实 UDP 丢包/抖动用命令行 <code>speedlite-cli</code>）。</span>
     </div>
   </section>
 
@@ -97,7 +106,7 @@
       </thead>
       <tbody></tbody>
     </table>
-    <p class="table-note">TCP 使用有序 stop/result 建立共同统计边界，双端字节偏差 &lt;1% 才算正常。UDP 显示 WebRTC 应用层「交付损失」，并把提交、排空、接收和队列残留分开；它不是 IP 层 UDP 丢包率。网页无法精确测抖动，精确丢包/抖动请用命令行 <code>speedctl udp</code>。</p>
+    <p class="table-note">TCP 使用有序 stop/result 建立共同统计边界，双端字节偏差 &lt;1% 才算正常。UDP(WebRTC) 用可靠无序通道测吞吐（交付损失=0，因可靠通道不丢包）；真实 IP 层 UDP 丢包/抖动请用命令行 <code>speedlite-cli udp</code>（原生 socket）。</p>
     <div class="history" id="historyWrap" hidden>
       <h3>历史记录</h3>
       <ul id="history"></ul>
@@ -106,16 +115,16 @@
   </section>
 
   <section class="card cli">
-    <h2>命令行精确测速（speedctl）</h2>
+    <h2>命令行精确测速（speedlite-cli）</h2>
     <p>网页的 WebSocket / WebRTC 受浏览器协议栈开销影响，极限数值请用原生 socket 客户端：</p>
-    <pre id="cliHint">speedctl -s 服务器IP tcp up -P 4 -t 10
-speedctl -s 服务器IP tcp down -P 4 -t 10
-speedctl -s 服务器IP udp up -P 1 -l 60000 -t 10
-speedctl -s 服务器IP udp down -P 1 -l 60000 -t 10</pre>
+    <pre id="cliHint">speedlite-cli -s 服务器IP tcp up -P 4 -t 10
+speedlite-cli -s 服务器IP tcp down -P 4 -t 10
+speedlite-cli -s 服务器IP udp up -P 1 -l 60000 -t 10
+speedlite-cli -s 服务器IP udp down -P 1 -l 60000 -t 10</pre>
   </section>
 </main>
 
-<footer>speedTest · Go + WebSocket + WebRTC</footer>
+<footer>SpeedLite · Go + WebSocket + WebRTC</footer>
 
 <script src="app.js"></script>
 </body>
