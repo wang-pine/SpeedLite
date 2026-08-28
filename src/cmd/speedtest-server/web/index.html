@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>speedTest · 带宽测速</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚡</text></svg>">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="logo">⚡</span>
+    <h1>speedTest</h1>
+    <span class="sub">TCP / UDP 上下行带宽测速</span>
+  </div>
+  <div class="server-info" id="serverInfo">服务器: <b id="serverHost">-</b></div>
+</header>
+
+<main>
+  <!-- 配置面板 -->
+  <section class="card config">
+    <h2>测速配置</h2>
+    <div class="grid">
+      <label>模式
+        <select id="cfgMode">
+          <option value="tcp">TCP（WebSocket）</option>
+          <option value="udp">UDP（WebRTC）</option>
+          <option value="both">TCP + UDP</option>
+        </select>
+      </label>
+      <label>方向
+        <select id="cfgDir">
+          <option value="down">下行</option>
+          <option value="up">上行</option>
+          <option value="both">双向</option>
+        </select>
+      </label>
+      <label>并行流数
+        <input type="number" id="cfgStreams" value="4" min="1" max="16">
+      </label>
+      <label>时长（秒）
+        <input type="number" id="cfgDuration" value="10" min="1" max="120">
+      </label>
+      <label>包大小（字节）
+        <input type="number" id="cfgPacketLen" value="131072" min="1024" max="1048576">
+      </label>
+      <label>服务器地址
+        <input type="text" id="cfgServer" placeholder="留空=当前页面服务器">
+      </label>
+    </div>
+    <div class="actions">
+      <button id="btnStart" class="primary">▶ 开始测速</button>
+      <button id="btnStop" disabled>■ 停止</button>
+      <span class="hint">浏览器 WebSocket 测 TCP；UDP 走 WebRTC DataChannel（真实 UDP 封装）。极限精度用命令行 <code>speedctl</code>。</span>
+    </div>
+  </section>
+
+  <!-- 实时速率 -->
+  <section class="card live">
+    <div class="meters">
+      <div class="meter down">
+        <div class="label">下行 ▼</div>
+        <div class="value" id="valDown">0.00</div>
+        <div class="unit">Mbit/s</div>
+      </div>
+      <div class="meter up">
+        <div class="label">上行 ▲</div>
+        <div class="value" id="valUp">0.00</div>
+        <div class="unit">Mbit/s</div>
+      </div>
+    </div>
+    <canvas id="chart" width="1100" height="300"></canvas>
+    <div class="chart-legend" id="chartLegend">
+      <span class="dot down"></span>下行(实线)
+      <span class="dot up"></span>上行(虚线)
+    </div>
+    <div class="live-progress">
+      <div class="progress-track"><div id="progressBar" class="progress-fill" style="width:0%"></div></div>
+      <div id="liveDetail" class="live-detail">就绪</div>
+    </div>
+  </section>
+
+  <!-- 结果 -->
+  <section class="card results">
+    <h2>测速结果
+      <span class="results-toolbar">
+        <button id="btnRefresh" class="secondary small" title="清空缓存的曲线与结论">⟳ 刷新清空</button>
+      </span>
+    </h2>
+    <table id="resultTable">
+      <thead>
+        <tr>
+          <th>链路</th><th>方向</th><th>平均</th><th>峰值</th><th>总传输</th>
+          <th>交付损失</th><th>抖动</th><th>用时</th><th>时间</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+    <p class="table-note">TCP 使用有序 stop/result 建立共同统计边界，双端字节偏差 &lt;1% 才算正常。UDP 显示 WebRTC 应用层「交付损失」，并把提交、排空、接收和队列残留分开；它不是 IP 层 UDP 丢包率。网页无法精确测抖动，精确丢包/抖动请用命令行 <code>speedctl udp</code>。</p>
+    <div class="history" id="historyWrap" hidden>
+      <h3>历史记录</h3>
+      <ul id="history"></ul>
+      <button id="btnClearHistory">清空历史</button>
+    </div>
+  </section>
+
+  <section class="card cli">
+    <h2>命令行精确测速（speedctl）</h2>
+    <p>网页的 WebSocket / WebRTC 受浏览器协议栈开销影响，极限数值请用原生 socket 客户端：</p>
+    <pre id="cliHint">speedctl -s 服务器IP tcp up -P 4 -t 10
+speedctl -s 服务器IP tcp down -P 4 -t 10
+speedctl -s 服务器IP udp up -P 1 -l 60000 -t 10
+speedctl -s 服务器IP udp down -P 1 -l 60000 -t 10</pre>
+  </section>
+</main>
+
+<footer>speedTest · Go + WebSocket + WebRTC</footer>
+
+<script src="app.js"></script>
+</body>
+</html>

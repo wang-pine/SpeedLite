@@ -308,3 +308,107 @@ test('UDP upload drains before signaling stop and requires server result', async
   assert.equal(done[0].err, null);
   assert.equal(done[0].result.queuedBytes, 0);
 });
+
+test('result rendering distinguishes TCP reconciliation from UDP delivery and queue truncation', () => {
+  const rows = [];
+  const tbody = {
+    appendChild(element) { rows.push(element); },
+    querySelectorAll() { return rows; },
+  };
+  document.querySelector = (selector) => {
+    assert.equal(selector, '#resultTable tbody');
+    return tbody;
+  };
+  document.createElement = () => ({ className: '', dataset: {}, innerHTML: '' });
+
+  const base = {
+    avgMbitps: 8,
+    peakMbitps: 9,
+    totalBytes: MiB,
+    duration: 1,
+    streams: 1,
+    upBytes: 0,
+    downBytes: MiB,
+    downMbps: 8,
+    upMbps: 0,
+    jitter: 0,
+    lossPct: 0,
+    srvBytes: MiB,
+    srvAvg: 8,
+    srvPeak: 9,
+  };
+
+  core.addResultRow('tcp', 'down', { ...base, devPct: 1.2 });
+  assert.match(rows.map((row) => row.innerHTML).join('\n'), /对账异常/);
+
+  rows.length = 0;
+  core.addResultRow('udp', 'down', {
+    ...base,
+    devPct: 16.7,
+    lossPct: 16.7,
+    truncated: true,
+    srvSubmittedBytes: 10 * MiB,
+    srvQueuedBytes: 4 * MiB,
+  });
+  const html = rows.map((row) => row.innerHTML).join('\n');
+  assert.match(html, /交付损失/);
+  assert.match(html, /队列截断/);
+  assert.match(html, /data-label="抖动">—</);
+});
+
+test('peakFromPoints uses synchronized aggregate samples instead of per-stream maxima', () => {
+  const points = [
+    { t: 0.0, down: 10, up: 1 },
+    { t: 0.5, down: 20, up: 2 },
+    { t: 1.0, down: 30, up: 3 },
+    { t: 2.1, down: 8, up: 4 },
+  ];
+  assert.equal(core.peakFromPoints(points, 'down'), 20);
+  assert.equal(core.peakFromPoints(points, 'up'), 4);
+  assert.equal(core.peakFromPoints(points, 'both'), 22);
+});
+
+test('aggregate marks partial parallel-stream completion as incomplete', () => {
+  const result = core.aggregate([
+    {
+      err: null,
+      res: {
+        totalBytes: MiB,
+        duration: 1,
+        peakMbitps: 1,
+        upBytes: 0,
+        downBytes: MiB,
+      },
+    },
+    { err: new Error('stream failed'), res: null },
+  ], 'down', 1);
+  assert.equal(result.streams, 1);
+  assert.equal(result.failedStreams, 1);
+  assert.equal(result.incomplete, true);
+});
+
+test('upload detail row labels uploaded bytes instead of downlink zero', () => {
+  const rows = [];
+  const tbody = { appendChild(element) { rows.push(element); } };
+  document.querySelector = () => tbody;
+  document.createElement = () => ({ className: '', dataset: {}, innerHTML: '' });
+  core.addResultRow('tcp', 'up', {
+    avgMbitps: 8,
+    peakMbitps: 8,
+    totalBytes: MiB,
+    duration: 1,
+    streams: 1,
+    upBytes: MiB,
+    downBytes: 0,
+    downMbps: 0,
+    upMbps: 8,
+    lossPct: 0,
+    devPct: 0,
+    srvBytes: MiB,
+    srvAvg: 8,
+    srvPeak: 8,
+  });
+  const html = rows.map((row) => row.innerHTML).join('\n');
+  assert.match(html, /上行 1\.00 MiB/);
+  assert.doesNotMatch(html, /下行 0 B/);
+});

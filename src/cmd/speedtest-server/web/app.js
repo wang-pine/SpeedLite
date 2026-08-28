@@ -7,10 +7,9 @@
  *              信令经 /ws/signal 交换 SDP
  *
  * 说明：
- *  - UDP(WebRTC unreliable) 的真实丢包率由「双端对账」实测：服务端发出/收到
- *    与浏览器收到/发出之差即为丢包（结果表丢包率列直接展示，偏差分级警示）。
- *    抖动无法从浏览器精确获得（0 ms，精确值请用 CLI speedctl）。
- *  - TCP 为可靠通道，丢包率恒 0%；对账偏差若大说明网络异常/缓冲截断。
+ *  - UDP(WebRTC unreliable) 展示应用层交付损失：排队残留单独报告，不冒充
+ *    IP 层 UDP 丢包；网页抖动不可用，精确值请用 CLI speedctl。
+ *  - TCP 使用同一 WebSocket 上的有序 start/stop/result 建立共同统计边界。
  *  - 双向(both)方向：下行与上行同时进行，本地分别计数。
  */
 (function () {
@@ -103,6 +102,26 @@ async function waitForBufferedDrain(channel, timeoutMs = 3000, pollMs = 10) {
     await new Promise((resolve) => setTimeout(resolve, pollMs));
   }
   return Math.max(0, Number(channel.bufferedAmount || 0));
+}
+
+function peakFromPoints(points, dir) {
+  const rateOf = (point) => dir === 'up'
+    ? Number(point.up || 0)
+    : dir === 'down'
+      ? Number(point.down || 0)
+      : Number(point.down || 0) + Number(point.up || 0);
+  let start = 0;
+  let sum = 0;
+  let peak = 0;
+  for (let end = 0; end < points.length; end++) {
+    sum += rateOf(points[end]);
+    while (start < end && points[start].t < points[end].t - 1) {
+      sum -= rateOf(points[start]);
+      start++;
+    }
+    peak = Math.max(peak, sum / (end - start + 1));
+  }
+  return peak;
 }
 
 /* ---------- 全局实时聚合（供大数字/曲线） ---------- */
@@ -551,16 +570,16 @@ function runUDP(cfg) {
 }
 
 /* ---------- 结果汇聚 ---------- */
-function aggregate(results, dir, phaseDuration) {
+function aggregate(results, dir, phaseDuration, phasePeak) {
   let totalBytes = 0, duration = 0, peakSum = 0;
   let upBytes = 0, downBytes = 0;
   let submittedBytes = 0, queuedBytes = 0, truncated = false;
   // 服务端对账（双重统计）
   let srvBytes = 0, srvAvg = 0, srvPeak = 0, srvCount = 0;
   let srvSubmittedBytes = 0, srvQueuedBytes = 0;
-  let okCount = 0;
+  let okCount = 0, failedCount = 0;
   for (const r of results) {
-    if (!r || !r.res || r.err) continue;
+    if (!r || !r.res || r.err) { failedCount++; continue; }
     okCount++;
     const x = r.res;
     totalBytes += x.totalBytes || 0;
@@ -589,9 +608,9 @@ function aggregate(results, dir, phaseDuration) {
   const upMbps = upBytes * 8 / duration / 1e6;
   const downMbps = downBytes * 8 / duration / 1e6;
   const avgMbitps = dir === 'up' ? upMbps : dir === 'down' ? downMbps : upMbps + downMbps;
-  // 对账：双端统计差异 = 传输损耗/丢包的真实度量。
-  // - down: 服务端发出 > 客户端收到 → 丢包（unreliable 通道特征）
-  // - up:   客户端发出 > 服务端收到 → 丢包
+  // 对账：TCP 检查共同边界上的字节一致性；UDP 计算应用层交付差额。
+  // - down: 服务端已排空 > 客户端收到 → 交付损失
+  // - up:   客户端已排空 > 服务端收到 → 交付损失
   // - both: 双方合计比较 → 总偏差
   let lossPct = null, devPct = null;
   if (srvCount && totalBytes > 0) {
@@ -606,12 +625,14 @@ function aggregate(results, dir, phaseDuration) {
   return {
     totalBytes, duration,
     avgMbitps,
-    peakMbitps: peakSum,
+    peakMbitps: Number.isFinite(phasePeak) ? phasePeak : peakSum,
     upBytes, downBytes, upMbps, downMbps,
     submittedBytes, queuedBytes, truncated,
     streams: okCount,
+    failedStreams: failedCount,
+    incomplete: failedCount > 0,
     jitter: 0,
-    // 对账：lossPct=方向性丢包率，devPct=双端总偏差
+    // lossPct=UDP 方向性交付损失，devPct=双端总偏差
     srvBytes: srvCount ? srvBytes : null,
     srvAvg: srvCount ? srvAvg : null,
     srvPeak: srvCount ? srvPeak : null,
@@ -633,15 +654,15 @@ function addResultRow(mode, dir, r) {
     avgCell = `▼ ${(r.downMbps).toFixed(1)} / ▲ ${(r.upMbps).toFixed(1)} Mbit/s`;
   }
   const timeCell = new Date().toLocaleTimeString();
-  // 丢包率：UDP 有对账时显示真实丢包率（双端统计差值），否则 0%
-  // TCP 走可靠通道，丢包率恒 0%（重传在协议内消化）；对账偏差在明细行分级警示
+  // 网页 UDP 展示应用层交付损失；它不是 IP 层 UDP 包丢失率。
   let lostCell = mode === 'udp' && r.lossPct !== null && r.lossPct !== undefined
     ? r.lossPct.toFixed(1) + '%' : '0%';
   let lostCls = '';
   if (mode === 'udp' && r.lossPct !== null && r.lossPct !== undefined) {
     lostCls = r.lossPct > 30 ? 'num-bad' : r.lossPct > 5 ? 'num-warn' : 'num-ok';
   }
-  const jitterCell = (r.jitter || 0).toFixed(1) + ' ms';
+  const jitterCell = '—';
+  const lossLabel = mode === 'udp' ? '交付损失' : '丢包率';
   // 主行：每个 td 带 data-label，手机竖屏下 CSS 卡片化时展示列名
   tr.innerHTML = `
     <td data-label="链路">${mode.toUpperCase()}</td>
@@ -649,7 +670,7 @@ function addResultRow(mode, dir, r) {
     <td data-label="平均">${avgCell}</td>
     <td data-label="峰值">${(r.peakMbitps).toFixed(1)} Mbit/s</td>
     <td data-label="总传输">${fmtBytes(r.totalBytes)}</td>
-    <td data-label="丢包率" class="${lostCls}">${lostCell}</td>
+    <td data-label="${lossLabel}" class="${lostCls}">${lostCell}</td>
     <td data-label="抖动">${jitterCell}</td>
     <td data-label="用时">${r.duration.toFixed(1)} s</td>
     <td data-label="时间" class="time">${timeCell}</td>`;
@@ -658,20 +679,40 @@ function addResultRow(mode, dir, r) {
   const detail = document.createElement('tr');
   detail.className = 'row-detail';
   detail.dataset.key = `${mode}|${dir}`;
-  let detailTxt = `${r.streams} 条并行流 · ` +
-    `下行 ${fmtBytes(r.downBytes)}${dir === 'both' ? ' · 上行 ' + fmtBytes(r.upBytes) : ''}`;
+  const directionBytes = dir === 'up'
+    ? `上行 ${fmtBytes(r.upBytes)}`
+    : dir === 'down'
+      ? `下行 ${fmtBytes(r.downBytes)}`
+      : `下行 ${fmtBytes(r.downBytes)} · 上行 ${fmtBytes(r.upBytes)}`;
+  let detailTxt = `${r.streams} 条并行流 · ${directionBytes}`;
+  if (r.incomplete) detailTxt += ` · ${r.failedStreams} 条流失败（结果不完整）`;
   if (r.srvBytes !== null && r.srvBytes !== undefined) {
     const dev = (r.devPct !== null && r.devPct !== undefined) ? r.devPct : 0;
-    // 分级：<5% 正常 / 5-30% 警告 / >30% 异常（数据不可信）
     let grade, gradeCls;
-    if (dev < 5) { grade = '对账正常'; gradeCls = 'rec-ok'; }
-    else if (dev < 30) { grade = '偏差较大'; gradeCls = 'rec-warn'; }
-    else { grade = '严重损耗 ⚠'; gradeCls = 'rec-bad'; }
+    if (mode === 'tcp') {
+      if (dev < 1) { grade = '对账正常'; gradeCls = 'rec-ok'; }
+      else { grade = '对账异常 ⚠'; gradeCls = 'rec-bad'; }
+    } else if (r.truncated) {
+      grade = '队列截断 ⚠'; gradeCls = 'rec-bad';
+    } else if (dev < 5) {
+      grade = '交付正常'; gradeCls = 'rec-ok';
+    } else if (dev < 30) {
+      grade = '交付损失较大'; gradeCls = 'rec-warn';
+    } else {
+      grade = '严重交付损失 ⚠'; gradeCls = 'rec-bad';
+    }
     let warnNote = '';
-    if (dev >= 5) {
-      warnNote = mode === 'udp'
-        ? ` · 双端统计相差 ${dev.toFixed(1)}%（unreliable 通道丢包所致，结果仅供参考）`
-        : ` · 双端统计相差 ${dev.toFixed(1)}%（TCP 不应丢包，请检查网络/缓冲截断）`;
+    if (mode === 'udp') {
+      const submitted = r.srvSubmittedBytes === null || r.srvSubmittedBytes === undefined
+        ? r.srvBytes : r.srvSubmittedBytes;
+      const queued = r.srvQueuedBytes || 0;
+      warnNote = ` · 提交 ${fmtBytes(submitted)} · 排空 ${fmtBytes(r.srvBytes)} · ` +
+        `接收 ${fmtBytes(r.totalBytes)} · 残留 ${fmtBytes(queued)}`;
+      if (dev >= 5 && !r.truncated) {
+        warnNote += ` · 应用层交付相差 ${dev.toFixed(1)}%`;
+      }
+    } else if (dev >= 1) {
+      warnNote = ` · 双端统计相差 ${dev.toFixed(1)}%（TCP 共同边界不一致，请检查异常断链）`;
     }
     detailTxt += ` · <span class="srv-rec">服务器对账: 传输 ${fmtBytes(r.srvBytes)} · ` +
       `平均 ${(r.srvAvg).toFixed(1)} Mbit/s · 峰值 ${(r.srvPeak).toFixed(1)} Mbit/s · ` +
@@ -763,13 +804,19 @@ async function start() {
       state.curSeries = ensureSeries(mode, cfg.dir);
       renderLegend(state.series);
       state.phaseText = `正在测试 ${mode.toUpperCase()} · ${cfg.dir === 'up' ? '上行' : cfg.dir === 'down' ? '下行' : '双向'}`;
+      const phaseStartedAt = performance.now();
       const results = (mode === 'tcp') ? await runTCP(cfg) : await runUDP(cfg);
       if (results && results.allFailed) {
         throw new Error(results.message || `所有 ${mode.toUpperCase()} 流均失败`);
       }
-      const agg = aggregate(results, cfg.dir);
+      const phaseDuration = Math.max((performance.now() - phaseStartedAt) / 1000, 0.001);
+      const phasePeak = peakFromPoints(state.curSeries ? state.curSeries.points : [], cfg.dir);
+      const agg = aggregate(results, cfg.dir, phaseDuration, phasePeak);
+      if (!agg) throw new Error(`所有 ${mode.toUpperCase()} 流均失败`);
       addResultRow(mode, cfg.dir, agg);
-      saveHistory({ ts: Date.now(), mode, dir: cfg.dir, avgMbitps: agg.avgMbitps });
+      if (!agg.incomplete) {
+        saveHistory({ ts: Date.now(), mode, dir: cfg.dir, avgMbitps: agg.avgMbitps });
+      }
     }
     state.curSeries = null;
     state.phaseText = '测试完成';
@@ -856,7 +903,7 @@ document.addEventListener('DOMContentLoaded', () => {
 if (typeof window !== 'undefined' && window !== undefined) {
   window.__speedTestCore = {
     aggregate, addResultRow, removeResultRow, drainedBytes, waitForBufferedDrain,
-    makeStreamResult, runTCPStream, runUDPStream,
+    peakFromPoints, makeStreamResult, runTCPStream, runUDPStream,
   };
 }
 
