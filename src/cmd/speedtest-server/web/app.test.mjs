@@ -9,20 +9,23 @@ const document = {
   addEventListener() {},
   getElementById() { return null; },
 };
-
-vm.runInNewContext(source, {
+const context = {
   window,
   document,
   performance,
   console,
+  URLSearchParams,
   setInterval,
   clearInterval,
   setTimeout,
   clearTimeout,
-}, { filename: 'app.js' });
+};
+
+vm.runInNewContext(source, context, { filename: 'app.js' });
 
 const core = window.__speedTestCore;
 const MiB = 1024 * 1024;
+const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 test('drainedBytes excludes queued data without underflow', () => {
   assert.ok(Math.abs(core.drainedBytes(10 * MiB, 6.37 * MiB) - 3.63 * MiB) < 1e-6);
@@ -107,4 +110,80 @@ test('makeStreamResult uses explicit duration and drained upload bytes', () => {
   assert.equal(result.submittedBytes, 10 * MiB);
   assert.equal(result.queuedBytes, 6.37 * MiB);
   assert.equal(result.truncated, true);
+});
+
+test('TCP upload starts on server start and completes only on result', async (t) => {
+  class FakeWebSocket {
+    static CONNECTING = 0;
+    static OPEN = 1;
+    static CLOSED = 3;
+    static instances = [];
+
+    constructor(url) {
+      this.url = url;
+      this.readyState = FakeWebSocket.CONNECTING;
+      this.bufferedAmount = 0;
+      this.sent = [];
+      FakeWebSocket.instances.push(this);
+    }
+
+    send(data) {
+      this.sent.push(data);
+      if (data && typeof data.byteLength === 'number') this.bufferedAmount += data.byteLength;
+    }
+
+    close() {
+      if (this.readyState === FakeWebSocket.CLOSED) return;
+      this.readyState = FakeWebSocket.CLOSED;
+      if (this.onclose) this.onclose({ code: 1000 });
+    }
+  }
+  context.WebSocket = FakeWebSocket;
+
+  const done = [];
+  core.runTCPStream({
+    dir: 'up',
+    streams: 1,
+    duration: 0.01,
+    packetLen: 1024,
+    wsBase: 'ws://test.invalid',
+  }, 'tcp-test', (err, result) => done.push({ err, result }));
+
+  const ws = FakeWebSocket.instances[0];
+  t.after(() => {
+    if (ws.readyState !== FakeWebSocket.CLOSED) {
+      ws.onmessage({ data: JSON.stringify({
+        type: 'result',
+        result: { total_bytes: 0, duration: 0.01, avg_mbitps: 0, peak_mbitps: 0 },
+      }) });
+      ws.close();
+    }
+  });
+
+  ws.readyState = FakeWebSocket.OPEN;
+  ws.onopen();
+  await wait(5);
+  assert.equal(ws.sent.length, 0, 'open alone must not start upload traffic');
+
+  ws.onmessage({ data: JSON.stringify({ type: 'start' }) });
+  await wait(5);
+  assert.ok(
+    ws.sent.some((item) => typeof item !== 'string' && typeof item.byteLength === 'number'),
+    'start must begin binary traffic',
+  );
+
+  await wait(20);
+  const stop = ws.sent.find((item) => typeof item === 'string' && JSON.parse(item).type === 'stop');
+  assert.ok(stop, 'duration boundary must enqueue an ordered stop message');
+  assert.equal(done.length, 0, 'stop alone must not complete a successful stream');
+
+  ws.bufferedAmount = 0;
+  ws.onmessage({ data: JSON.stringify({
+    type: 'result',
+    result: { total_bytes: 16 * MiB, duration: 0.01, avg_mbitps: 0, peak_mbitps: 0 },
+  }) });
+  await wait(0);
+  assert.equal(done.length, 1);
+  assert.equal(done[0].err, null);
+  assert.ok(done[0].result.srv);
 });

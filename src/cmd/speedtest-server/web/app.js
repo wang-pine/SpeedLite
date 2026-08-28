@@ -300,39 +300,53 @@ function runTCPStream(cfg, streamId, doneCb) {
   live.add(streamId, meter);
   state.streams.add(ws);
   let sendTimer = null;
+  let stopTimer = null;
   let finished = false;
   let opened = false;      // 是否成功建立连接
+  let startedAt = null;
   let lastError = null;
 
   const zeroBuf = new Uint8Array(cfg.packetLen);
   let sentTotal = 0;   // 累计送入 send() 的字节
-  let srvResult = null; // 服务端最终统计（对账）
 
   const finish = (err, res) => {
     if (finished) return;
     finished = true;
-    if (sendTimer) clearInterval(sendTimer);   // 停止发送（尾包留给网络排空）
-    try { meter.syncTX(sentTotal); } catch (e) {}
+    if (sendTimer) clearInterval(sendTimer);
+    if (stopTimer) clearTimeout(stopTimer);
+    clearTimeout(watchdog);
     live.remove(streamId);
     state.streams.delete(ws);
-    // 服务端 result 在停流后发出：不能立即 close(ws)，否则 result 丢失。
-    // 停发后保持连接，等服务端统计短暂到达（对账），超时则降级。
-    const finalize = () => {
-      try { ws.close(); } catch (e) {}
-      if (res && srvResult) res.srv = srvResult;
-      doneCb(err, res);
-    };
-    if (srvResult) { finalize(); return; }
-    const waitStart = Date.now();
-    const iv = setInterval(() => {
-      if (srvResult) {
-        clearInterval(iv);
-        finalize();
-      } else if (Date.now() - waitStart > 3000) {
-        clearInterval(iv);
-        finalize(); // 未拿到服务端统计，降级继续
+    try { ws.close(); } catch (e) {}
+    doneCb(err, res);
+  };
+
+  const watchdog = setTimeout(() => {
+    finish(new Error('TCP 测速超时：服务端未返回最终统计'));
+  }, (cfg.duration + 10) * 1000);
+
+  const startTransfer = () => {
+    if (startedAt !== null) return;
+    startedAt = performance.now();
+    meter.createdAt = startedAt;
+    meter.lastT = startedAt;
+    if (cfg.dir === 'up' || cfg.dir === 'both') {
+      sendTimer = setInterval(() => {
+        if (ws.readyState !== WebSocket.OPEN) { clearInterval(sendTimer); return; }
+        while (ws.readyState === WebSocket.OPEN && ws.bufferedAmount < 16 * 1024 * 1024) {
+          ws.send(zeroBuf);
+          sentTotal += cfg.packetLen;
+        }
+      }, 0);
+      meter.sync = () => meter.syncTX(sentTotal - (ws.readyState === WebSocket.OPEN ? ws.bufferedAmount : 0));
+    }
+    stopTimer = setTimeout(() => {
+      if (sendTimer) { clearInterval(sendTimer); sendTimer = null; }
+      if ((cfg.dir === 'up' || cfg.dir === 'both') && ws.readyState === WebSocket.OPEN) {
+        // stop 与此前二进制帧共用有序 WebSocket；服务端读到它即确认全部上行负载。
+        ws.send(JSON.stringify({ type: 'stop' }));
       }
-    }, 100);
+    }, cfg.duration * 1000);
   };
 
   ws.onmessage = (ev) => {
@@ -341,34 +355,23 @@ function runTCPStream(cfg, streamId, doneCb) {
     } else if (typeof ev.data === 'string') {
       let msg; try { msg = JSON.parse(ev.data); } catch (e) { return; }
       if (msg.type === 'error') lastError = new Error(msg.error);
-      else if (msg.type === 'result' && msg.result) srvResult = msg.result;
-      // 忽略 sample（前端本地采样）；result 用于服务端对账
+      else if (msg.type === 'start') startTransfer();
+      else if (msg.type === 'result' && msg.result) {
+        if (startedAt === null) {
+          finish(new Error('TCP 测速协议错误：result 早于 start'));
+          return;
+        }
+        const duration = Math.max((performance.now() - startedAt) / 1000, 0.001);
+        const res = makeStreamResult(meter, cfg.dir, duration, sentTotal, 0);
+        res.srv = msg.result;
+        finish(null, res);
+      }
     }
   };
 
   ws.onopen = () => {
     opened = true;
-    if (cfg.dir === 'up' || cfg.dir === 'both') {
-      sendTimer = setInterval(() => {
-        if (ws.readyState !== WebSocket.OPEN) { clearInterval(sendTimer); return; }
-        while (ws.readyState === WebSocket.OPEN && ws.bufferedAmount < 16 * 1024 * 1024) {
-          ws.send(zeroBuf);
-          sentTotal += cfg.packetLen;
-          // 不在这里 addTX：等缓冲排空后由采样校正为真实已发
-        }
-      }, 0);
-      // 采样校正：真实已发 = 累计send − 缓冲滞留
-      meter.sync = () => meter.syncTX(sentTotal - (ws.readyState === WebSocket.OPEN ? ws.bufferedAmount : 0));
-    }
   };
-
-  // 时长到时结束
-  setTimeout(() => {
-    if (ws.readyState === WebSocket.OPEN) {
-      // 结束前先让缓冲排空
-      finish(null, makeStreamResult(meter, cfg.dir));
-    }
-  }, cfg.duration * 1000 + 200);
 
   ws.onclose = (ev) => {
     if (!opened && !finished) {
@@ -382,11 +385,9 @@ function runTCPStream(cfg, streamId, doneCb) {
       return;
     }
     if (finished) return;
-    if (lastError) {
-      finish(lastError);
-      return;
-    }
-    finish(null, makeStreamResult(meter, cfg.dir));
+    finish(lastError || new Error(
+      `TCP 测速连接在服务端统计返回前关闭${ev && ev.code ? ` (code=${ev.code})` : ''}`,
+    ));
   };
   ws.onerror = (e) => { lastError = e && e.error ? e.error : null; };
 }
@@ -833,7 +834,9 @@ document.addEventListener('DOMContentLoaded', () => {
 
 // 调试/测试钩子（对前端无副作用）
 if (typeof window !== 'undefined' && window !== undefined) {
-  window.__speedTestCore = { aggregate, addResultRow, removeResultRow, drainedBytes, makeStreamResult };
+  window.__speedTestCore = {
+    aggregate, addResultRow, removeResultRow, drainedBytes, makeStreamResult, runTCPStream,
+  };
 }
 
 })();
