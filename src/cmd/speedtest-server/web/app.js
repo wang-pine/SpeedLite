@@ -97,6 +97,14 @@ function drainedBytes(submitted, queued) {
   return Math.max(0, Number(submitted || 0) - Math.max(0, Number(queued || 0)));
 }
 
+async function waitForBufferedDrain(channel, timeoutMs = 3000, pollMs = 10) {
+  const deadline = performance.now() + timeoutMs;
+  while (channel.bufferedAmount > 0 && performance.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, pollMs));
+  }
+  return Math.max(0, Number(channel.bufferedAmount || 0));
+}
+
 /* ---------- 全局实时聚合（供大数字/曲线） ---------- */
 const live = {
   meters: new Map(),
@@ -422,46 +430,48 @@ function runUDPStream(cfg, streamId, doneCb) {
   live.add(streamId, meter);
   state.streams.add(pc);
   let sendTimer = null;
+  let stopTimer = null;
   let finished = false;
+  let startedAt = null;
+  let localQueued = 0;
+  let lastError = null;
 
   const config = { ordered: false, maxRetransmits: 0 };
   const dc = pc.createDataChannel('speedtest-' + streamId, config);
+  dc.binaryType = 'arraybuffer';
 
   const signal = new WebSocket(`${cfg.wsBase}/ws/signal?dir=${cfg.dir}&duration=${cfg.duration}&packet_len=${cfg.packetLen}&stream_id=${streamId}`);
   const zeroBuf = new Uint8Array(cfg.packetLen);
   let sentTotal = 0;   // 累计送入 dc.send() 的字节
-  let srvResult = null; // 服务端最终统计（对账）
 
   const finish = (err, res) => {
     if (finished) return;
     finished = true;
     if (sendTimer) clearInterval(sendTimer);
-    try { meter.syncTX(sentTotal); } catch (e) {}
+    if (stopTimer) clearTimeout(stopTimer);
+    clearTimeout(watchdog);
     try { dc.close(); } catch (e) {}
     try { pc.close(); } catch (e) {}
     live.remove(streamId);
     state.streams.delete(pc);
-    // 服务端 result 在停流后稍晚（~数百 ms）通过信令连接发送。
-    // 不能立即 close(signal)：先等 result 到达（对账），超时则降级。
-    const finalize = () => {
-      if (!res) { doneCb(err); return; }
-      if (srvResult) res.srv = srvResult;
-      doneCb(null, res);
-    };
-    if (srvResult) { finalize(); return; }
-    // 等待 result（最长 2.5s），期间不关闭信令
-    const waitStart = Date.now();
-    const iv = setInterval(() => {
-      if (srvResult) {
-        clearInterval(iv);
-        try { signal.close(); } catch (e) {}
-        finalize();
-      } else if (Date.now() - waitStart > 2500) {
-        clearInterval(iv);
-        try { signal.close(); } catch (e) {}
-        finalize(); // 未拿到服务端统计，降级继续
-      }
-    }, 100);
+    try { signal.close(); } catch (e) {}
+    doneCb(err, res);
+  };
+
+  const watchdog = setTimeout(() => {
+    finish(new Error('UDP 测速超时：服务端未返回最终统计'));
+  }, (cfg.duration + 10) * 1000);
+
+  const stopUpload = async () => {
+    if (sendTimer) { clearInterval(sendTimer); sendTimer = null; }
+    localQueued = await waitForBufferedDrain(dc, 3000, 10);
+    if (finished) return;
+    meter.syncTX(drainedBytes(sentTotal, localQueued));
+    if (signal.readyState === WebSocket.OPEN) {
+      signal.send(JSON.stringify({ type: 'stop', queued_bytes: localQueued }));
+    } else {
+      finish(new Error('UDP 测速信令在 stop 前关闭'));
+    }
   };
 
   signal.onopen = async () => {
@@ -479,18 +489,30 @@ function runUDPStream(cfg, streamId, doneCb) {
     } else if (msg.type === 'error') {
       finish(new Error('UDP 测速: ' + msg.error));
     } else if (msg.type === 'result' && msg.result) {
-      srvResult = msg.result;  // 服务端对账统计
+      if (startedAt === null) {
+        finish(new Error('UDP 测速协议错误：result 早于 DataChannel open'));
+        return;
+      }
+      const duration = Math.max((performance.now() - startedAt) / 1000, 0.001);
+      const res = makeStreamResult(meter, cfg.dir, duration, sentTotal, localQueued);
+      res.srv = msg.result;
+      finish(null, res);
     }
   };
-  signal.onerror = (e) => { /* onclose 会跟随 */ };
+  signal.onerror = (e) => { lastError = e && e.error ? e.error : null; };
   signal.onclose = (ev) => {
     if (!finished) {
-      // 区分：还没收到 answer 就关闭 = 信令失败；已收到 answer 正常关闭 = OK
-      finish(new Error(`UDP 信令连接异常关闭 (${ev && ev.code !== undefined ? 'code=' + ev.code : '未建立'})`));
+      finish(lastError || new Error(
+        `UDP 信令在服务端统计返回前关闭 (${ev && ev.code !== undefined ? 'code=' + ev.code : '未建立'})`,
+      ));
     }
   };
 
   dc.onopen = () => {
+    if (startedAt !== null) return;
+    startedAt = performance.now();
+    meter.createdAt = startedAt;
+    meter.lastT = startedAt;
     if (cfg.dir === 'up' || cfg.dir === 'both') {
       sendTimer = setInterval(() => {
         if (dc.readyState !== 'open') { clearInterval(sendTimer); return; }
@@ -501,6 +523,7 @@ function runUDPStream(cfg, streamId, doneCb) {
       }, 0);
       // 采样校正：真实已发 = 累计send − 缓冲滞留
       meter.sync = () => meter.syncTX(sentTotal - (dc.readyState === 'open' ? dc.bufferedAmount : 0));
+      stopTimer = setTimeout(stopUpload, cfg.duration * 1000);
     }
   };
   dc.onmessage = (ev) => {
@@ -508,13 +531,10 @@ function runUDPStream(cfg, streamId, doneCb) {
       meter.addRX(ev.data.byteLength);
     }
   };
-  dc.onclose = () => { if (!finished) finish(null, makeStreamResult(meter, cfg.dir)); };
-  dc.onerror = () => {};
-
-  // 时长到时结束
-  setTimeout(() => {
-    if (dc.readyState === 'open') finish(null, makeStreamResult(meter, cfg.dir));
-  }, cfg.duration * 1000 + 300);
+  dc.onclose = () => {
+    if (!finished) finish(new Error('UDP DataChannel 在服务端统计返回前关闭'));
+  };
+  dc.onerror = (e) => { lastError = e && e.error ? e.error : lastError; };
 }
 
 function runUDP(cfg) {
@@ -835,7 +855,8 @@ document.addEventListener('DOMContentLoaded', () => {
 // 调试/测试钩子（对前端无副作用）
 if (typeof window !== 'undefined' && window !== undefined) {
   window.__speedTestCore = {
-    aggregate, addResultRow, removeResultRow, drainedBytes, makeStreamResult, runTCPStream,
+    aggregate, addResultRow, removeResultRow, drainedBytes, waitForBufferedDrain,
+    makeStreamResult, runTCPStream, runUDPStream,
   };
 }
 

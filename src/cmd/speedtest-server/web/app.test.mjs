@@ -187,3 +187,124 @@ test('TCP upload starts on server start and completes only on result', async (t)
   assert.equal(done[0].err, null);
   assert.ok(done[0].result.srv);
 });
+
+test('waitForBufferedDrain returns zero on drain and residual on timeout', async () => {
+  const values = [10, 4, 0];
+  let index = 0;
+  const draining = {
+    get bufferedAmount() {
+      const value = values[index];
+      if (index < values.length - 1) index++;
+      return value;
+    },
+  };
+  assert.equal(await core.waitForBufferedDrain(draining, 50, 1), 0);
+  assert.equal(await core.waitForBufferedDrain({ bufferedAmount: 7 }, 2, 1), 7);
+});
+
+test('UDP upload drains before signaling stop and requires server result', async (t) => {
+  class FakeDataChannel {
+    constructor() {
+      this.readyState = 'connecting';
+      this.bufferedAmount = 0;
+      this.sent = [];
+    }
+
+    send(data) {
+      this.sent.push(data);
+      this.bufferedAmount += data.byteLength || 0;
+    }
+
+    close() {
+      if (this.readyState === 'closed') return;
+      this.readyState = 'closed';
+      if (this.onclose) this.onclose();
+    }
+  }
+
+  class FakePeerConnection {
+    static instances = [];
+
+    constructor() {
+      this.dc = new FakeDataChannel();
+      FakePeerConnection.instances.push(this);
+    }
+
+    createDataChannel() { return this.dc; }
+    async createOffer() { return { type: 'offer', sdp: 'offer-sdp' }; }
+    async setLocalDescription(offer) { this.localDescription = offer; }
+    async setRemoteDescription(answer) { this.remoteDescription = answer; }
+    close() { this.closed = true; }
+  }
+
+  class FakeSignal {
+    static OPEN = 1;
+    static CLOSED = 3;
+    static instances = [];
+
+    constructor(url) {
+      this.url = url;
+      this.readyState = FakeSignal.OPEN;
+      this.sent = [];
+      FakeSignal.instances.push(this);
+    }
+
+    send(data) { this.sent.push(data); }
+    close() {
+      if (this.readyState === FakeSignal.CLOSED) return;
+      this.readyState = FakeSignal.CLOSED;
+      if (this.onclose) this.onclose({ code: 1000 });
+    }
+  }
+
+  context.RTCPeerConnection = FakePeerConnection;
+  context.WebSocket = FakeSignal;
+  const done = [];
+  core.runUDPStream({
+    dir: 'up',
+    duration: 0.01,
+    packetLen: 1024,
+    wsBase: 'ws://test.invalid',
+  }, 'udp-test', (err, result) => done.push({ err, result }));
+
+  const pc = FakePeerConnection.instances[0];
+  const dc = pc.dc;
+  const signal = FakeSignal.instances[0];
+  t.after(() => {
+    if (signal.readyState !== FakeSignal.CLOSED) {
+      signal.onmessage({ data: JSON.stringify({
+        type: 'result',
+        result: { total_bytes: 8 * MiB, up_bytes: 8 * MiB, duration: 0.01 },
+      }) });
+      signal.close();
+    }
+  });
+
+  await signal.onopen();
+  await wait(0);
+  signal.onmessage({ data: JSON.stringify({ type: 'answer', sdp: 'answer-sdp' }) });
+  await wait(0);
+  dc.readyState = 'open';
+  dc.onopen();
+  await wait(5);
+  assert.ok(dc.sent.length > 0, 'open DataChannel must begin upload traffic');
+
+  await wait(10);
+  dc.bufferedAmount = 0;
+  await wait(10);
+  const stop = signal.sent
+    .map((item) => JSON.parse(item))
+    .find((item) => item.type === 'stop');
+  assert.ok(stop, 'drained upload must send stop over reliable signaling');
+  assert.equal(stop.queued_bytes, 0);
+  assert.equal(done.length, 0, 'stop alone must not complete a successful stream');
+
+  signal.onmessage({ data: JSON.stringify({
+    type: 'result',
+    result: { total_bytes: 8 * MiB, up_bytes: 8 * MiB, duration: 0.01 },
+  }) });
+  await wait(0);
+  assert.equal(done.length, 1);
+  assert.equal(done[0].err, null);
+  assert.equal(done[0].result.queuedBytes, 0);
+});
