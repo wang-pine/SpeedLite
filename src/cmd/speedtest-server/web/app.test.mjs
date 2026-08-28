@@ -96,6 +96,33 @@ test('UDP delivery loss excludes server queue residual', () => {
   assert.equal(result.truncated, true);
 });
 
+test('UDP both reconciles upload and download independently', () => {
+  const result = core.aggregate([{
+    err: null,
+    res: {
+      totalBytes: 13 * MiB,
+      duration: 8,
+      upBytes: 8 * MiB,
+      downBytes: 5 * MiB,
+      submittedBytes: 10 * MiB,
+      queuedBytes: 2 * MiB,
+      srv: {
+        total_bytes: 12 * MiB,
+        up_bytes: 6 * MiB,
+        down_bytes: 6 * MiB,
+        submitted_bytes: 10 * MiB,
+        queued_bytes: 4 * MiB,
+      },
+    },
+  }], 'both', 8);
+
+  assert.equal(result.srvUpBytes, 6 * MiB);
+  assert.equal(result.srvDownBytes, 6 * MiB);
+  assert.ok(Math.abs(result.upLossPct - 25) < 1e-9);
+  assert.ok(Math.abs(result.downLossPct - (100 / 6)) < 1e-9);
+  assert.ok(Math.abs(result.lossPct - (3 / 14 * 100)) < 1e-9);
+});
+
 test('makeStreamResult uses explicit duration and drained upload bytes', () => {
   const result = core.makeStreamResult({
     rx: 0,
@@ -186,6 +213,37 @@ test('TCP upload starts on server start and completes only on result', async (t)
   assert.equal(done.length, 1);
   assert.equal(done[0].err, null);
   assert.ok(done[0].result.srv);
+});
+
+test('TCP disconnect before result fails exactly once', () => {
+  class ClosingWebSocket {
+    static CONNECTING = 0;
+    static OPEN = 1;
+    static CLOSED = 3;
+    static instance;
+
+    constructor() {
+      this.readyState = ClosingWebSocket.CONNECTING;
+      this.bufferedAmount = 0;
+      ClosingWebSocket.instance = this;
+    }
+
+    close() { this.readyState = ClosingWebSocket.CLOSED; }
+  }
+  context.WebSocket = ClosingWebSocket;
+  const done = [];
+  core.runTCPStream({
+    dir: 'down', duration: 1, packetLen: 1024, wsBase: 'ws://test.invalid',
+  }, 'tcp-early-close', (err, result) => done.push({ err, result }));
+  const ws = ClosingWebSocket.instance;
+  ws.readyState = ClosingWebSocket.OPEN;
+  ws.onopen();
+  ws.onmessage({ data: JSON.stringify({ type: 'start' }) });
+  ws.onclose({ code: 1006 });
+  ws.onclose({ code: 1006 });
+  assert.equal(done.length, 1);
+  assert.match(done[0].err.message, /统计返回前关闭/);
+  assert.equal(done[0].result, undefined);
 });
 
 test('waitForBufferedDrain returns zero on drain and residual on timeout', async () => {
@@ -307,6 +365,12 @@ test('UDP upload drains before signaling stop and requires server result', async
   assert.equal(done.length, 1);
   assert.equal(done[0].err, null);
   assert.equal(done[0].result.queuedBytes, 0);
+
+  signal.onmessage({ data: JSON.stringify({
+    type: 'result',
+    result: { total_bytes: 8 * MiB, up_bytes: 8 * MiB, duration: 0.01 },
+  }) });
+  assert.equal(done.length, 1, 'duplicate result must not complete the stream twice');
 });
 
 test('result rendering distinguishes TCP reconciliation from UDP delivery and queue truncation', () => {
@@ -411,4 +475,40 @@ test('upload detail row labels uploaded bytes instead of downlink zero', () => {
   const html = rows.map((row) => row.innerHTML).join('\n');
   assert.match(html, /上行 1\.00 MiB/);
   assert.doesNotMatch(html, /下行 0 B/);
+});
+
+test('UDP upload detail uses browser submitted and drained bytes', () => {
+  const rows = [];
+  const tbody = { appendChild(element) { rows.push(element); } };
+  document.querySelector = () => tbody;
+  document.createElement = () => ({ className: '', dataset: {}, innerHTML: '' });
+  core.addResultRow('udp', 'up', {
+    avgMbitps: 8,
+    peakMbitps: 8,
+    totalBytes: 8 * MiB,
+    duration: 1,
+    streams: 1,
+    upBytes: 8 * MiB,
+    downBytes: 0,
+    submittedBytes: 10 * MiB,
+    queuedBytes: 2 * MiB,
+    downMbps: 0,
+    upMbps: 8,
+    lossPct: 25,
+    upLossPct: 25,
+    downLossPct: null,
+    devPct: 25,
+    srvBytes: 6 * MiB,
+    srvUpBytes: 6 * MiB,
+    srvDownBytes: 0,
+    srvSubmittedBytes: 0,
+    srvQueuedBytes: 0,
+    srvAvg: 6,
+    srvPeak: 7,
+  });
+  const html = rows.map((row) => row.innerHTML).join('\n');
+  assert.match(html, /提交 10\.00 MiB/);
+  assert.match(html, /排空 8\.00 MiB/);
+  assert.match(html, /接收 6\.00 MiB/);
+  assert.match(html, /残留 2\.00 MiB/);
 });

@@ -12,8 +12,12 @@ package rtcbridge
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
+	"math"
 	"net/http"
+	"net/url"
+	"strconv"
 	"sync"
 	"time"
 
@@ -41,14 +45,53 @@ type signalMessage struct {
 // rtcStats 汇聚单个 DataChannel 测速流的两端统计。
 // 服务器视角：客户端上行 = rx（收到）；客户端下行 = tx（发出）。
 type rtcStats struct {
-	rx *engine.Sampler
-	tx *engine.Sampler
+	rx        *engine.Sampler
+	tx        *engine.Sampler
+	startOnce sync.Once
+	startedAt time.Time
 
 	mu            sync.Mutex
 	downSubmitted uint64
 	downQueued    uint64
 	downDrained   uint64
 	downTruncated bool
+}
+
+func newRTCStats() *rtcStats { return &rtcStats{} }
+
+func (s *rtcStats) start() {
+	s.startOnce.Do(func() {
+		s.startedAt = time.Now()
+		s.rx = engine.NewSampler(100 * time.Millisecond)
+		s.tx = engine.NewSampler(100 * time.Millisecond)
+	})
+}
+
+func (s *rtcStats) activeDuration() float64 {
+	s.start()
+	return time.Since(s.startedAt).Seconds()
+}
+
+func parseSignalParams(q url.Values) (*engine.Params, error) {
+	p := &engine.Params{Mode: engine.ModeUDP, Direction: engine.Direction(q.Get("dir")), Streams: 1}
+	var err error
+	if raw := q.Get("duration"); raw != "" {
+		p.Duration, err = strconv.ParseFloat(raw, 64)
+		if err != nil || math.IsNaN(p.Duration) || math.IsInf(p.Duration, 0) || p.Duration <= 0 {
+			return nil, fmt.Errorf("invalid duration: %q", raw)
+		}
+	}
+	if raw := q.Get("packet_len"); raw != "" {
+		value, parseErr := strconv.ParseInt(raw, 10, 32)
+		if parseErr != nil || value <= 0 {
+			return nil, fmt.Errorf("invalid packet_len: %q", raw)
+		}
+		p.PacketLen = int(value)
+	}
+	if err := p.Validate(); err != nil {
+		return nil, err
+	}
+	return p, nil
 }
 
 func drainSnapshot(submitted, buffered uint64) (drained, queued uint64, truncated bool) {
@@ -80,23 +123,21 @@ func waitForDrain(buffered func() uint64, timeout time.Duration) uint64 {
 // HandleSignal 处理 WebRTC 信令连接。
 // query 参数：dir(down|up|both)、duration、packet_len、stream_id
 func HandleSignal(w http.ResponseWriter, r *http.Request) {
+	p, err := parseSignalParams(r.URL.Query())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	dir := string(p.Direction)
+	duration := p.Duration
+	packetLen := p.PacketLen
+
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Printf("signal upgrade: %v", err)
 		return
 	}
 	defer conn.Close()
-
-	q := r.URL.Query()
-	dir := q.Get("dir")
-	duration := atof(q.Get("duration"))
-	packetLen := atoi(q.Get("packet_len"))
-	if duration <= 0 {
-		duration = 10
-	}
-	if packetLen <= 0 {
-		packetLen = 131072
-	}
 
 	// 读 offer
 	conn.SetReadDeadline(time.Now().Add(30 * time.Second))
@@ -123,16 +164,16 @@ func HandleSignal(w http.ResponseWriter, r *http.Request) {
 	var cancelOnce sync.Once
 	cancelAll := func() { cancelOnce.Do(func() { close(cancel) }) }
 	defer cancelAll()
-	downDone := make(chan struct{})
-	upDone := make(chan struct{})
+	downDone := make(chan error, 1)
+	upDone := make(chan error, 1)
 	if dir != "down" && dir != "both" {
-		close(downDone)
+		downDone <- nil
 	}
 	if dir != "up" && dir != "both" {
-		close(upDone)
+		upDone <- nil
 	}
 
-	st := &rtcStats{rx: engine.NewSampler(100 * time.Millisecond), tx: engine.NewSampler(100 * time.Millisecond)}
+	st := newRTCStats()
 
 	// 数据通道处理
 	pc.OnDataChannel(func(dc *webrtc.DataChannel) {
@@ -172,27 +213,36 @@ func HandleSignal(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 				if control.Type == "stop" {
-					close(upDone)
+					upDone <- nil
 					return
 				}
 			}
 		}()
 	}
 
-	completed := make(chan struct{})
-	go func() {
-		<-downDone
-		<-upDone
-		close(completed)
-	}()
-
-	select {
-	case <-completed:
-	case <-signalErr:
-		return
-	case <-time.After(time.Duration(duration+10) * time.Second):
+	watchdog := time.NewTimer(time.Duration(duration+10) * time.Second)
+	defer watchdog.Stop()
+	waitDirection := func(done <-chan error) error {
+		select {
+		case err := <-done:
+			return err
+		case err := <-signalErr:
+			return err
+		case <-watchdog.C:
+			return fmt.Errorf("WebRTC speed test timed out")
+		case <-cancel:
+			return fmt.Errorf("WebRTC speed test cancelled")
+		}
+	}
+	if err := waitDirection(downDone); err != nil {
+		_ = conn.WriteJSON(signalMessage{Type: "error", Error: err.Error()})
 		return
 	}
+	if err := waitDirection(upDone); err != nil {
+		_ = conn.WriteJSON(signalMessage{Type: "error", Error: err.Error()})
+		return
+	}
+	activeDuration := st.activeDuration()
 	cancelAll()
 
 	// stop 触发后，给在途数据（上行残留包 / 下行缓冲排空）一点时间抵达
@@ -234,31 +284,39 @@ func HandleSignal(w http.ResponseWriter, r *http.Request) {
 		res.PeakMbps = res.PeakMBps * 8
 		setResultAverage(res)
 	}
+	res.Duration = activeDuration
+	setResultAverage(res)
 	_ = conn.WriteJSON(signalMessage{Type: "result", Result: res})
 	_ = conn.Close()
 }
 
 // handleDataChannel 在一个 DataChannel 上执行打流。
-func handleDataChannel(dc *webrtc.DataChannel, dir string, duration float64, packetLen int, st *rtcStats, cancel <-chan struct{}, downDone chan<- struct{}) {
+func handleDataChannel(dc *webrtc.DataChannel, dir string, duration float64, packetLen int, st *rtcStats, cancel <-chan struct{}, downDone chan<- error) {
 	dc.SetBufferedAmountLowThreshold(1 << 20)
 
 	// 读：处理客户端上行（up/both）——服务器计数接收量
 	if dir == "up" || dir == "both" {
 		dc.OnMessage(func(msg webrtc.DataChannelMessage) {
 			if !msg.IsString {
+				st.start()
 				st.rx.Add(uint64(len(msg.Data)))
 			}
 		})
 	}
 
 	dc.OnOpen(func() {
+		st.start()
 		if dir == "down" || dir == "both" {
 			go func() {
-				sendDown(dc, duration, packetLen, st, cancel)
-				close(downDone)
+				downDone <- sendDown(dc, duration, packetLen, st, cancel)
 			}()
 		}
 	})
+}
+
+type dataChannelSender interface {
+	Send([]byte) error
+	BufferedAmount() uint64
 }
 
 // sendDown 服务器持续发送满包（下行）。
@@ -268,9 +326,11 @@ func handleDataChannel(dc *webrtc.DataChannel, dir string, duration float64, pac
 // 因此用 bufferedAmount 阈值做发送端背压：缓冲水位高时暂停，
 // 让接收端消化速度成为真实测速瓶颈（与浏览器端 send 背压同理）。
 // 发送量为真实进入通道的字节（st.tx 计数），用于服务端对账。
-func sendDown(dc *webrtc.DataChannel, duration float64, packetLen int, st *rtcStats, cancel <-chan struct{}) {
+func sendDown(dc dataChannelSender, duration float64, packetLen int, st *rtcStats, cancel <-chan struct{}) error {
+	st.start()
 	buf := engine.NewZeroBuffer(packetLen)
-	deadline := time.After(time.Duration(duration * float64(time.Second)))
+	deadline := time.NewTimer(time.Duration(duration * float64(time.Second)))
+	defer deadline.Stop()
 
 	const (
 		highWater = 4 * 1024 * 1024 // 4MiB 缓冲水位上限
@@ -281,17 +341,12 @@ func sendDown(dc *webrtc.DataChannel, duration float64, packetLen int, st *rtcSt
 	for {
 		select {
 		case <-cancel:
-			return
-		case <-deadline:
+			finalizeDown(st, dc.BufferedAmount())
+			return fmt.Errorf("downlink cancelled")
+		case <-deadline.C:
 			remaining := waitForDrain(dc.BufferedAmount, 3*time.Second)
-			drained, queued, truncated := drainSnapshot(st.tx.Bytes(), remaining)
-			st.mu.Lock()
-			st.downSubmitted = st.tx.Bytes()
-			st.downQueued = queued
-			st.downDrained = drained
-			st.downTruncated = truncated
-			st.mu.Unlock()
-			return
+			finalizeDown(st, remaining)
+			return nil
 		default:
 		}
 		// 背压：缓冲超过高水位时等待其回落
@@ -300,27 +355,34 @@ func sendDown(dc *webrtc.DataChannel, duration float64, packetLen int, st *rtcSt
 			for dc.BufferedAmount() > lowWater {
 				select {
 				case <-cancel:
-					return
-				case <-deadline:
+					finalizeDown(st, dc.BufferedAmount())
+					return fmt.Errorf("downlink cancelled")
+				case <-deadline.C:
 					remaining := waitForDrain(dc.BufferedAmount, 3*time.Second)
-					drained, queued, truncated := drainSnapshot(st.tx.Bytes(), remaining)
-					st.mu.Lock()
-					st.downSubmitted = st.tx.Bytes()
-					st.downQueued = queued
-					st.downDrained = drained
-					st.downTruncated = truncated
-					st.mu.Unlock()
-					return
+					finalizeDown(st, remaining)
+					return nil
 				default:
 					time.Sleep(sleepNs)
 				}
 			}
 		}
 		if err := dc.Send(buf); err != nil {
-			return
+			finalizeDown(st, dc.BufferedAmount())
+			return err
 		}
 		st.tx.Add(uint64(len(buf)))
 	}
+}
+
+func finalizeDown(st *rtcStats, remaining uint64) {
+	submitted := st.tx.Bytes()
+	drained, queued, truncated := drainSnapshot(submitted, remaining)
+	st.mu.Lock()
+	st.downSubmitted = submitted
+	st.downQueued = queued
+	st.downDrained = drained
+	st.downTruncated = truncated
+	st.mu.Unlock()
 }
 
 func setResultAverage(result *engine.Stats) {
@@ -334,37 +396,4 @@ func max(a, b float64) float64 {
 		return a
 	}
 	return b
-}
-
-func atoi(s string) int {
-	n := 0
-	for _, c := range s {
-		if c < '0' || c > '9' {
-			return 0
-		}
-		n = n*10 + int(c-'0')
-	}
-	return n
-}
-
-func atof(s string) float64 {
-	f := 0.0
-	dec := 0.1
-	inDec := false
-	for _, c := range s {
-		if c == '.' && !inDec {
-			inDec = true
-			continue
-		}
-		if c < '0' || c > '9' {
-			return 0
-		}
-		if inDec {
-			f += float64(c-'0') * dec
-			dec /= 10
-		} else {
-			f = f*10 + float64(c-'0')
-		}
-	}
-	return f
 }

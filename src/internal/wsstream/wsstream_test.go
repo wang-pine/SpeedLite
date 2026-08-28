@@ -66,6 +66,12 @@ func TestUpResultWaitsForStop(t *testing.T) {
 		if got := message.Result.TotalBytes; got != uint64(wantBytes) {
 			t.Fatalf("result bytes = %d, want %d", got, wantBytes)
 		}
+		if got := message.Result.UpBytes; got != uint64(wantBytes) {
+			t.Fatalf("result up_bytes = %d, want %d", got, wantBytes)
+		}
+		if message.Result.DownBytes != 0 {
+			t.Fatalf("result down_bytes = %d, want 0", message.Result.DownBytes)
+		}
 		return
 	}
 }
@@ -113,6 +119,12 @@ func TestDownResultFollowsAllBinaryFrames(t *testing.T) {
 		}
 		if message.Result.TotalBytes != received {
 			t.Fatalf("received %d bytes before result, server reports %d", received, message.Result.TotalBytes)
+		}
+		if message.Result.DownBytes != received {
+			t.Fatalf("received %d bytes before result, server down_bytes = %d", received, message.Result.DownBytes)
+		}
+		if message.Result.UpBytes != 0 {
+			t.Fatalf("result up_bytes = %d, want 0", message.Result.UpBytes)
 		}
 		return
 	}

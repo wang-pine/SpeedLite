@@ -270,11 +270,15 @@ func runStream(conn *websocket.Conn, p *engine.Params) {
 	res := &engine.Stats{}
 	if p.Direction == engine.DirDown {
 		res = &txRes
+		res.DownBytes = txRes.TotalBytes
 	} else if p.Direction == engine.DirUp {
 		res = &rxRes
+		res.UpBytes = rxRes.TotalBytes
 	} else {
 		// both：取上行+下行合计
 		res.TotalBytes = rxRes.TotalBytes + txRes.TotalBytes
+		res.UpBytes = rxRes.TotalBytes
+		res.DownBytes = txRes.TotalBytes
 		res.Duration = rxRes.Duration
 		res.AvgMBps = float64(res.TotalBytes) / (1024 * 1024) / max(rxRes.Duration, 0.001)
 		res.AvgMbps = res.AvgMBps * 8

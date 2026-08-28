@@ -1,9 +1,51 @@
 package rtcbridge
 
 import (
+	"errors"
+	"net/url"
 	"testing"
 	"time"
 )
+
+func TestParseSignalParamsRejectsUnsafeValues(t *testing.T) {
+	tests := []url.Values{
+		{"dir": {"sideways"}},
+		{"dir": {"down"}, "duration": {"999999"}},
+		{"dir": {"down"}, "duration": {"NaN"}},
+		{"dir": {"down"}, "duration": {"-1"}},
+		{"dir": {"down"}, "packet_len": {"2147483647"}},
+		{"dir": {"down"}, "packet_len": {"-1"}},
+		{"dir": {"down"}, "duration": {"not-a-number"}},
+	}
+	for _, values := range tests {
+		if _, err := parseSignalParams(values); err == nil {
+			t.Fatalf("parseSignalParams(%v) succeeded, want error", values)
+		}
+	}
+}
+
+func TestParseSignalParamsAppliesSafeDefaults(t *testing.T) {
+	p, err := parseSignalParams(url.Values{"dir": {"both"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Direction != "both" || p.Duration != 10 || p.PacketLen != 131072 {
+		t.Fatalf("unexpected params: %+v", p)
+	}
+}
+
+type failingDataChannel struct{}
+
+func (failingDataChannel) Send([]byte) error      { return errors.New("send failed") }
+func (failingDataChannel) BufferedAmount() uint64 { return 0 }
+
+func TestSendDownPropagatesSendError(t *testing.T) {
+	st := newRTCStats()
+	err := sendDown(failingDataChannel{}, 1, 1024, st, make(chan struct{}))
+	if err == nil || err.Error() != "send failed" {
+		t.Fatalf("sendDown error = %v, want send failed", err)
+	}
+}
 
 func TestDrainSnapshot(t *testing.T) {
 	tests := []struct {

@@ -577,6 +577,7 @@ function aggregate(results, dir, phaseDuration, phasePeak) {
   // 服务端对账（双重统计）
   let srvBytes = 0, srvAvg = 0, srvPeak = 0, srvCount = 0;
   let srvSubmittedBytes = 0, srvQueuedBytes = 0;
+  let srvUpBytes = 0, srvDownBytes = 0;
   let okCount = 0, failedCount = 0;
   for (const r of results) {
     if (!r || !r.res || r.err) { failedCount++; continue; }
@@ -598,6 +599,12 @@ function aggregate(results, dir, phaseDuration, phasePeak) {
       srvPeak += s.peak_mbitps || 0;
       srvSubmittedBytes += s.submitted_bytes || s.total_bytes || 0;
       srvQueuedBytes += s.queued_bytes || 0;
+      const hasUpBytes = Object.prototype.hasOwnProperty.call(s, 'up_bytes');
+      const hasDownBytes = Object.prototype.hasOwnProperty.call(s, 'down_bytes');
+      srvUpBytes += hasUpBytes ? (s.up_bytes || 0)
+        : (dir === 'up' ? (s.total_bytes || 0) : 0);
+      srvDownBytes += hasDownBytes ? (s.down_bytes || 0)
+        : (dir === 'down' ? (s.total_bytes || 0) : 0);
       truncated = truncated || Boolean(s.truncated);
       srvCount++;
     }
@@ -612,14 +619,18 @@ function aggregate(results, dir, phaseDuration, phasePeak) {
   // - down: 服务端已排空 > 客户端收到 → 交付损失
   // - up:   客户端已排空 > 服务端收到 → 交付损失
   // - both: 双方合计比较 → 总偏差
-  let lossPct = null, devPct = null;
+  let lossPct = null, upLossPct = null, downLossPct = null, devPct = null;
   if (srvCount && totalBytes > 0) {
     const big = Math.max(totalBytes, srvBytes);
     devPct = big > 0 ? (Math.abs(totalBytes - srvBytes) / big * 100) : 0;
-    if (dir === 'down' && srvBytes > 0) {
-      lossPct = Math.max(0, (srvBytes - totalBytes) / srvBytes * 100);
-    } else if (dir === 'up' && totalBytes > 0) {
-      lossPct = Math.max(0, (totalBytes - srvBytes) / totalBytes * 100);
+    if (upBytes > 0) upLossPct = Math.max(0, (upBytes - srvUpBytes) / upBytes * 100);
+    if (srvDownBytes > 0) downLossPct = Math.max(0, (srvDownBytes - downBytes) / srvDownBytes * 100);
+    if (dir === 'up') lossPct = upLossPct;
+    else if (dir === 'down') lossPct = downLossPct;
+    else {
+      const offered = upBytes + srvDownBytes;
+      const missing = Math.max(0, upBytes - srvUpBytes) + Math.max(0, srvDownBytes - downBytes);
+      lossPct = offered > 0 ? missing / offered * 100 : 0;
     }
   }
   return {
@@ -638,7 +649,9 @@ function aggregate(results, dir, phaseDuration, phasePeak) {
     srvPeak: srvCount ? srvPeak : null,
     srvSubmittedBytes: srvCount ? srvSubmittedBytes : null,
     srvQueuedBytes: srvCount ? srvQueuedBytes : null,
-    lossPct, devPct,
+    srvUpBytes: srvCount ? srvUpBytes : null,
+    srvDownBytes: srvCount ? srvDownBytes : null,
+    lossPct, upLossPct, downLossPct, devPct,
   };
 }
 
@@ -687,7 +700,9 @@ function addResultRow(mode, dir, r) {
   let detailTxt = `${r.streams} 条并行流 · ${directionBytes}`;
   if (r.incomplete) detailTxt += ` · ${r.failedStreams} 条流失败（结果不完整）`;
   if (r.srvBytes !== null && r.srvBytes !== undefined) {
-    const dev = (r.devPct !== null && r.devPct !== undefined) ? r.devPct : 0;
+    const dev = mode === 'udp' && r.lossPct !== null && r.lossPct !== undefined
+      ? r.lossPct
+      : ((r.devPct !== null && r.devPct !== undefined) ? r.devPct : 0);
     let grade, gradeCls;
     if (mode === 'tcp') {
       if (dev < 1) { grade = '对账正常'; gradeCls = 'rec-ok'; }
@@ -703,13 +718,25 @@ function addResultRow(mode, dir, r) {
     }
     let warnNote = '';
     if (mode === 'udp') {
-      const submitted = r.srvSubmittedBytes === null || r.srvSubmittedBytes === undefined
-        ? r.srvBytes : r.srvSubmittedBytes;
-      const queued = r.srvQueuedBytes || 0;
-      warnNote = ` · 提交 ${fmtBytes(submitted)} · 排空 ${fmtBytes(r.srvBytes)} · ` +
-        `接收 ${fmtBytes(r.totalBytes)} · 残留 ${fmtBytes(queued)}`;
+      if (dir === 'up') {
+        warnNote = ` · 上行: 提交 ${fmtBytes(r.submittedBytes || r.upBytes)} · ` +
+          `排空 ${fmtBytes(r.upBytes)} · 接收 ${fmtBytes(r.srvUpBytes ?? r.srvBytes)} · ` +
+          `残留 ${fmtBytes(r.queuedBytes || 0)}`;
+      } else if (dir === 'down') {
+        const submitted = r.srvSubmittedBytes ?? r.srvBytes;
+        warnNote = ` · 下行: 提交 ${fmtBytes(submitted)} · ` +
+          `排空 ${fmtBytes(r.srvDownBytes ?? r.srvBytes)} · 接收 ${fmtBytes(r.downBytes)} · ` +
+          `残留 ${fmtBytes(r.srvQueuedBytes || 0)}`;
+      } else {
+        warnNote = ` · 上行: 提交 ${fmtBytes(r.submittedBytes || r.upBytes)} · ` +
+          `排空 ${fmtBytes(r.upBytes)} · 接收 ${fmtBytes(r.srvUpBytes || 0)} · ` +
+          `残留 ${fmtBytes(r.queuedBytes || 0)} · ` +
+          `下行: 提交 ${fmtBytes(r.srvSubmittedBytes ?? r.srvDownBytes)} · ` +
+          `排空 ${fmtBytes(r.srvDownBytes || 0)} · 接收 ${fmtBytes(r.downBytes)} · ` +
+          `残留 ${fmtBytes(r.srvQueuedBytes || 0)}`;
+      }
       if (dev >= 5 && !r.truncated) {
-        warnNote += ` · 应用层交付相差 ${dev.toFixed(1)}%`;
+        warnNote += ` · 应用层交付损失 ${dev.toFixed(1)}%`;
       }
     } else if (dev >= 1) {
       warnNote = ` · 双端统计相差 ${dev.toFixed(1)}%（TCP 共同边界不一致，请检查异常断链）`;
